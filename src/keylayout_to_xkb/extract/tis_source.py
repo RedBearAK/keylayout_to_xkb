@@ -152,6 +152,31 @@ def _cfstring_to_str(core_foundation, cfstring_ptr) -> str:
     return ''
 
 
+def _cfarray_of_strings(core_foundation, array_ptr) -> 'list[str]':
+    """Convert a CFArray of CFStringRef to a list of Python str.
+
+    Used for kTISPropertyInputSourceLanguages, which is Apple's authoritative
+    per-layout list of ISO 639 language codes (e.g. ['pl'], ['en'], or several
+    for a multilingual layout). Returns [] on any problem rather than raising --
+    a missing language list should not abort extraction of an otherwise-good
+    layout.
+    """
+
+    if not array_ptr:
+        return []
+    try:
+        count = core_foundation.CFArrayGetCount(array_ptr)
+    except Exception:
+        return []
+    langs = []
+    for index in range(count):
+        item = core_foundation.CFArrayGetValueAtIndex(array_ptr, index)
+        text = _cfstring_to_str(core_foundation, item)
+        if text:
+            langs.append(text)
+    return langs
+
+
 def _get_property_constant(hitoolbox, symbol_name: str):
     """Read an exported CFStringRef constant (a TIS property key) by symbol.
 
@@ -188,6 +213,8 @@ def extract_all_layouts(dump_dir: 'str | None' = None) -> 'list[dict]':
     prop_uchr = _get_property_constant(hitoolbox, 'kTISPropertyUnicodeKeyLayoutData')
     prop_name = _get_property_constant(hitoolbox, 'kTISPropertyLocalizedName')
     prop_id = _get_property_constant(hitoolbox, 'kTISPropertyInputSourceID')
+    prop_langs = _get_property_constant(
+        hitoolbox, 'kTISPropertyInputSourceLanguages')
 
     if prop_uchr is None:
         raise TISExtractionError(
@@ -212,6 +239,7 @@ def extract_all_layouts(dump_dir: 'str | None' = None) -> 'list[dict]':
 
         name = ''
         source_id = ''
+        languages = []
 
         if prop_name is not None:
             name_ref = hitoolbox.TISGetInputSourceProperty(source, prop_name)
@@ -221,30 +249,38 @@ def extract_all_layouts(dump_dir: 'str | None' = None) -> 'list[dict]':
             id_ref = hitoolbox.TISGetInputSourceProperty(source, prop_id)
             source_id = _cfstring_to_str(core_foundation, id_ref)
 
+        if prop_langs is not None:
+            langs_ref = hitoolbox.TISGetInputSourceProperty(source, prop_langs)
+            languages = _cfarray_of_strings(core_foundation, langs_ref)
+
         data_ref = hitoolbox.TISGetInputSourceProperty(source, prop_uchr)
         if not data_ref:
             # Many input sources (input methods, non-keyboard sources) have no
             # 'uchr' data. That is expected, not an error; skip quietly except
             # under debug.
             dbg('tis', f'no uchr data: index={index} name={name!r} id={source_id!r}')
-            results.append({'name': name, 'source_id': source_id, 'data': None})
+            results.append({'name': name, 'source_id': source_id,
+                            'data': None, 'languages': languages})
             continue
 
         data_len = core_foundation.CFDataGetLength(data_ref)
         byte_ptr = core_foundation.CFDataGetBytePtr(data_ref)
         if not byte_ptr or data_len <= 0:
             warn('tis', f'uchr data present but unreadable: name={name!r}')
-            results.append({'name': name, 'source_id': source_id, 'data': None})
+            results.append({'name': name, 'source_id': source_id,
+                            'data': None, 'languages': languages})
             continue
 
         raw = ctypes.string_at(byte_ptr, data_len)
-        dbg('tis', f'layout name={name!r} id={source_id!r} bytes={data_len}')
+        dbg('tis', f'layout name={name!r} id={source_id!r} bytes={data_len} '
+                   f'langs={languages}')
         dbg('tis', hex_window(raw, 0, 32))
 
         if dump_dir is not None:
             _dump_raw(dump_dir, source_id or f'index_{index}', raw)
 
-        results.append({'name': name, 'source_id': source_id, 'data': raw})
+        results.append({'name': name, 'source_id': source_id,
+                        'data': raw, 'languages': languages})
 
     return results
 

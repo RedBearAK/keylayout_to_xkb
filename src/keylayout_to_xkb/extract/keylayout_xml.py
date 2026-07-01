@@ -63,6 +63,7 @@ from keylayout_to_xkb.common.models import (
     SourceKind,
     ModifierState,
 )
+from keylayout_to_xkb.common.gestalt_keyboard import kind_of_type
 
 
 __version__ = '20260623'
@@ -76,22 +77,32 @@ class KeylayoutParseError(Exception):
 # Everything else in 0x00-0x1F (and 0x7F-0x9F) is illegal in XML 1.0, which is
 # what Python's ElementTree/expat enforces, even though .keylayout files declare
 # XML 1.1 and freely reference control chars as control-plane key outputs
-# (e.g. Ctrl+H -> &#x0008;). Those outputs are control-plane characters we never
-# emit anyway, so neutralising the references is lossless for our purposes.
+# (e.g. Ctrl+H -> &#x0008;). ElementTree cannot parse those references at all, so
+# to PRESERVE them (the binary parser keeps them, and the XML parser must reach
+# parity to serve as a complete standalone source) we rewrite each illegal
+# reference to a reversible Private-Use placeholder before parsing, then restore
+# the original control character in _decode_output. The placeholder for codepoint
+# C is U+E000 + C: every illegal C0/C1/DEL codepoint (<= 0x9F) maps into the
+# U+E000..U+E09F PUA block, which is XML-1.0-legal and trivially reversible.
 _XML10_LEGAL_CONTROL = {0x09, 0x0A, 0x0D}
+
+# Base of the reversible Private-Use placeholder block (placeholder = base + cp).
+_CONTROL_PLACEHOLDER_BASE = 0xE000
 
 _CHAR_REF_RGX = re.compile(r'&#x([0-9A-Fa-f]+);|&#([0-9]+);')
 
 
 def _sanitize_control_refs(source_text: str) -> str:
-    """Replace illegal-in-XML-1.0 control-char references with U+FFFD.
+    """Rewrite illegal-in-XML-1.0 control-char references to reversible markers.
 
-    .keylayout files declare XML 1.1 and use numeric references to C0 control
-    characters (control-plane key outputs). ElementTree only parses XML 1.0 and
-    rejects those references outright. We rewrite each illegal control reference
-    to the replacement character U+FFFD before parsing; such cells are
-    control-plane output we do not port, so nothing of value is lost. Legal
-    references (tab, newline, CR, and all normal characters) are left untouched.
+    .keylayout files declare XML 1.1 and use numeric references to C0/C1/DEL
+    control characters (control-plane key outputs, e.g. Ctrl+H -> &#x0008;).
+    ElementTree only parses XML 1.0 and rejects those references outright. To
+    keep the data (for parity with the binary parser, so a generated XKB layout
+    can be built from the XML alone) we rewrite each illegal reference to a
+    Private-Use placeholder U+E000 + codepoint, which parses cleanly and is
+    restored to the real control character in _decode_output. Legal references
+    (tab, newline, CR, and all normal characters) are left untouched.
     """
 
     def replace(match: 're.Match') -> str:
@@ -100,15 +111,12 @@ def _sanitize_control_refs(source_text: str) -> str:
         is_c0 = codepoint < 0x20
         is_c1_or_del = 0x7F <= codepoint <= 0x9F
         if (is_c0 or is_c1_or_del) and codepoint not in _XML10_LEGAL_CONTROL:
-            return '\uFFFD'
+            return chr(_CONTROL_PLACEHOLDER_BASE + codepoint)
         return match.group(0)
 
     return _CHAR_REF_RGX.sub(replace, source_text)
 
 
-# Gestalt keyboard-type values 18 and up are JIS keyboards; below that is
-# ANSI/ISO. Used only to tag a non-primary variant meaningfully.
-_JIS_TYPE_FLOOR = 18
 
 
 # --------------------------------------------------------------------------
@@ -142,13 +150,21 @@ _JIS_TYPE_FLOOR = 18
 # with no sided bits ever set, last-match-wins. This is deterministic; there is
 # nothing fuzzy to classify.
 
-# The generic modifier atoms a plane state may contain. caps/command/control are
-# never set for the four character planes, so they stay absent (= must be up).
+# The generic modifier atoms a plane state may contain. The four base planes set
+# no caps atom; the four caps planes add 'caps'. command/control are never set
+# for character planes, so they stay absent (= must be up). Both quartets are
+# captured because macOS layouts place genuinely-typeable output on the caps
+# layer (Latin behind caps on non-Latin layouts, unique caps+option symbols);
+# this mirrors the binary parser's eight-plane capture.
 _PLANE_STATES = {
-    ModifierState.PLAIN:        frozenset(),
-    ModifierState.SHIFT:        frozenset({'shift'}),
-    ModifierState.OPTION:       frozenset({'option'}),
-    ModifierState.SHIFT_OPTION: frozenset({'shift', 'option'}),
+    ModifierState.PLAIN:             frozenset(),
+    ModifierState.SHIFT:             frozenset({'shift'}),
+    ModifierState.OPTION:            frozenset({'option'}),
+    ModifierState.SHIFT_OPTION:      frozenset({'shift', 'option'}),
+    ModifierState.CAPS:              frozenset({'caps'}),
+    ModifierState.CAPS_SHIFT:        frozenset({'caps', 'shift'}),
+    ModifierState.CAPS_OPTION:       frozenset({'caps', 'option'}),
+    ModifierState.CAPS_SHIFT_OPTION: frozenset({'caps', 'shift', 'option'}),
 }
 
 # Map each rule token's base name to the generic atom it tests. Right-sided and
@@ -202,11 +218,11 @@ def _rule_matches(keys: str, state: 'frozenset') -> bool:
 def _resolve_modifier_map(keyboard: 'ET.Element') -> 'dict':
     """Map each character plane to its keyMap index by exact predicate eval.
 
-    For each of the four reachable plane states, evaluate every keyMapSelect's
-    rules in document order; the LAST keyMapSelect with a matching rule selects
-    that plane's table (TN2056 / UCKeyTranslate last-match-wins). Returns
-    {ModifierState: mapIndex}. A plane with no matching keyMapSelect is omitted
-    (the layout does not define that plane).
+    For each of the eight reachable plane states (four base + four caps),
+    evaluate every keyMapSelect's rules in document order; the LAST keyMapSelect
+    with a matching rule selects that plane's table (TN2056 / UCKeyTranslate
+    last-match-wins). Returns {ModifierState: mapIndex}. A plane with no matching
+    keyMapSelect is omitted (the layout does not define that plane).
     """
 
     modifier_map = keyboard.find('modifierMap')
@@ -259,15 +275,23 @@ def _decode_output(text: str) -> str:
     """Decode a key/action output attribute into the literal string.
 
     ElementTree already resolves XML entities and &#xNNNN; forms, so the
-    attribute value is the literal string. A lone U+FFFD is what
-    _sanitize_control_refs left in place of an illegal control-char reference;
-    it marks a control-plane cell we do not port, so it decodes to empty and the
-    caller omits the cell. This wrapper is the single place to add handling if a
-    non-standard escape is ever encountered.
+    attribute value is the literal string. Any character in the Private-Use
+    placeholder block U+E000..U+E09F is a control character that
+    _sanitize_control_refs rewrote so ElementTree could parse it (XML 1.0 forbids
+    raw C0/C1/DEL references); restore it to the real control codepoint so the
+    XML parser preserves the same control-plane output the binary parser keeps.
+    This is the single place control-reference handling lives.
     """
 
-    if text == '\uFFFD':
-        return ''
+    if not text:
+        return text
+    lo = _CONTROL_PLACEHOLDER_BASE
+    hi = _CONTROL_PLACEHOLDER_BASE + 0x9F
+    if any(lo <= ord(ch) <= hi for ch in text):
+        return ''.join(
+            chr(ord(ch) - _CONTROL_PLACEHOLDER_BASE) if lo <= ord(ch) <= hi else ch
+            for ch in text
+        )
     return text
 
 
@@ -475,15 +499,23 @@ def _parse_key_tables(
     return keys
 
 
-def _variant_tag(map_set_id: str, type_range: 'tuple | None') -> str:
+def _variant_tag(map_set_id: str, covered_types: 'set') -> str:
     """A short stable tag for a non-primary variant.
 
-    JIS keyboards are gestalt type 18+; if the range starts there, tag 'jis'.
-    Otherwise fall back to the mapSet id lowercased, stable per file.
+    Classify by the authoritative gestalt type->kind table (the same module the
+    binary parser uses), so both parsers tag a given keyboard type identically.
+    A mapSet may cover several types -- some generic, some kind-bearing (e.g.
+    German's ISO mapSet covers generic type 5 plus ISO types 8/9/13) -- so scan
+    ALL covered types and use the kind of the first kind-bearing one (lowest
+    type number, for stability), mirroring how the binary resolves a variant via
+    a representative kind-typed keyboard. If no covered type carries a kind, fall
+    back to the mapSet id lowercased, stable per file.
     """
 
-    if type_range is not None and type_range[0] >= _JIS_TYPE_FLOOR:
-        return 'jis'
+    for type_number in sorted(covered_types or ()):
+        kind = kind_of_type(type_number)
+        if kind is not None:
+            return kind.lower()
     return (map_set_id or 'alt').lower()
 
 
@@ -565,17 +597,34 @@ def parse_keylayout_xml(path: str) -> 'Layout':
 
     layout_rows = _parse_layouts_block(keyboard)
     if layout_rows:
-        seen_sets = {}
+        # Group rows by mapSet. Keep the FULL span (min first .. max last) and
+        # the set of every type number the mapSet covers, so the variant tag can
+        # be classified by a kind-bearing type (a mapSet may also cover a generic
+        # type, e.g. German's ISO mapSet covers generic type 5 plus ISO 8/9/13;
+        # using only the first row's type would misclassify it).
+        set_span = {}
+        set_types = {}
+        order = []
         for row in sorted(layout_rows, key=lambda r: r['first']):
-            seen_sets.setdefault(row['mapSet'], (row['first'], row['last']))
-        ordered_sets = list(seen_sets.items())
+            ms = row['mapSet']
+            if ms not in set_span:
+                set_span[ms] = (row['first'], row['last'])
+                set_types[ms] = set()
+                order.append(ms)
+            else:
+                lo, hi = set_span[ms]
+                set_span[ms] = (min(lo, row['first']), max(hi, row['last']))
+            set_types[ms].update(range(row['first'], row['last'] + 1))
+        ordered_sets = [
+            (ms, set_span[ms], set_types[ms]) for ms in order
+        ]
     else:
         only = keyboard.find('keyMapSet')
         if only is None:
             raise KeylayoutParseError('no <keyMapSet> element')
-        ordered_sets = [(only.get('id'), None)]
+        ordered_sets = [(only.get('id'), None, set())]
 
-    for position, (map_set_id, type_range) in enumerate(ordered_sets):
+    for position, (map_set_id, type_range, covered_types) in enumerate(ordered_sets):
         keys = _parse_key_tables(
             keyboard, map_set_id, plane_to_index, action_enters, action_outputs
         )
@@ -583,7 +632,7 @@ def parse_keylayout_xml(path: str) -> 'Layout':
             layout.keys = keys
             tag = ''
         else:
-            tag = _variant_tag(map_set_id, type_range)
+            tag = _variant_tag(map_set_id, covered_types)
         layout.variants.append(
             Variant(tag=tag, keys=keys, keyboard_type_range=type_range)
         )
@@ -591,7 +640,7 @@ def parse_keylayout_xml(path: str) -> 'Layout':
     dbg(
         'keylayout',
         f'variants: {len(layout.variants)} '
-        f'(mapSets {[s for s, _ in ordered_sets]})'
+        f'(mapSets {[s for s, _span, _types in ordered_sets]})'
     )
 
     for problem in layout.validate()[:10]:

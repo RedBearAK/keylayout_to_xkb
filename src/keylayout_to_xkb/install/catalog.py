@@ -47,6 +47,7 @@ class LayoutRecord:
     compose_complete:  bool = True
     dead_key_count:    int = 0
     key_count:         int = 0
+    source_languages:  'list' = field(default_factory=list)  # TIS ISO 639 codes
 
     def variant_names(self) -> 'list':
         return [name for name, _text in self.variants]
@@ -110,6 +111,106 @@ def derive_language(display_name: str, source_id: str = '') -> str:
             kept.append(word)
     group = ' '.join(kept).strip()
     return group if group else 'Other'
+
+
+# Language name -> (iso639 language code, iso3166 country code, short label).
+# Used to populate the registry's countryList / languageList / shortDescription
+# so desktop pickers show a flag and a tray label instead of a blank/placeholder.
+# The country code is what drives the flag icon in KDE; the short label is the
+# 2-3 char string shown in the layout-switcher applet. Unknown languages fall
+# back to no codes (better a missing flag than a WRONG country's flag).
+_LANGUAGE_ISO = {
+    'Arabic':     ('ara', 'SA', 'ar'),
+    'Armenian':   ('hye', 'AM', 'hy'),
+    'Bengali':    ('ben', 'IN', 'bn'),
+    'Bulgarian':  ('bul', 'BG', 'bg'),
+    'Chinese':    ('zho', 'CN', 'zh'),
+    'Croatian':   ('hrv', 'HR', 'hr'),
+    'Czech':      ('ces', 'CZ', 'cs'),
+    'Danish':     ('dan', 'DK', 'da'),
+    'Dutch':      ('nld', 'NL', 'nl'),
+    'English':    ('eng', 'US', 'en'),
+    'Finnish':    ('fin', 'FI', 'fi'),
+    'French':     ('fra', 'FR', 'fr'),
+    'Georgian':   ('kat', 'GE', 'ka'),
+    'German':     ('deu', 'DE', 'de'),
+    'Greek':      ('ell', 'GR', 'el'),
+    'Hebrew':     ('heb', 'IL', 'he'),
+    'Hindi':      ('hin', 'IN', 'hi'),
+    'Hungarian':  ('hun', 'HU', 'hu'),
+    'Icelandic':  ('isl', 'IS', 'is'),
+    'Italian':    ('ita', 'IT', 'it'),
+    'Japanese':   ('jpn', 'JP', 'ja'),
+    'Korean':     ('kor', 'KR', 'ko'),
+    'Norwegian':  ('nor', 'NO', 'no'),
+    'Polish':     ('pol', 'PL', 'pl'),
+    'Portuguese': ('por', 'PT', 'pt'),
+    'Romanian':   ('ron', 'RO', 'ro'),
+    'Russian':    ('rus', 'RU', 'ru'),
+    'Serbian':    ('srp', 'RS', 'sr'),
+    'Slovak':     ('slk', 'SK', 'sk'),
+    'Spanish':    ('spa', 'ES', 'es'),
+    'Swedish':    ('swe', 'SE', 'sv'),
+    'Thai':       ('tha', 'TH', 'th'),
+    'Tibetan':    ('bod', 'CN', 'bo'),
+    'Turkish':    ('tur', 'TR', 'tr'),
+    'Turkmen':    ('tuk', 'TM', 'tk'),
+    'Ukrainian':  ('ukr', 'UA', 'uk'),
+    'Vietnamese': ('vie', 'VN', 'vi'),
+
+    # Exotic / minority-script layouts. Primary language codes are Apple's own
+    # (from the TIS enumeration); country is the reasoned canonical home, or None
+    # where the language has no single-country flag (indigenous/cross-border) --
+    # None gives a correct language grouping but no (wrong) flag.
+    'Adlam':      ('ful', None, 'ff'),    # Fulani (Adlam script), West Africa, no single country
+    'Apache':     ('apw', 'US', 'apw'),   # Western Apache (USA)
+    'Cherokee':   ('chr', 'US', 'chr'),   # Cherokee (USA)
+    'Chickasaw':  ('cic', 'US', 'cic'),   # Chickasaw (USA)
+    'Hawaiian':   ('haw', 'US', 'haw'),
+    'Manipuri':   ('mni', 'IN', 'mni'),   # Meitei (India)
+    'Maori':      ('mri', 'NZ', 'mi'),
+    'Pahawh Hmong': ('hmn', None, 'hmn'), # Hmong (Pahawh script), cross-border
+    'Rejang':     ('rej', 'ID', 'rej'),   # Rejang (Indonesia)
+    'Wancho':     ('nnp', 'IN', 'nnp'),   # Wancho (India)
+    'Wolastoqey': ('pqm', 'CA', 'pqm'),   # Wolastoqey/Maliseet-Passamaquoddy (Canada/USA)
+    'Yiddish':    ('yid', None, 'yi'),    # cross-border
+    'Yoruba':     ('yor', 'NG', 'yo'),
+    'Welsh':      ('cym', 'GB', 'cy'),
+    'Uyghur':     ('uig', 'CN', 'ug'),
+    'Sami':       ('sme', None, 'se'),    # Northern Sami, cross-border
+}
+
+
+# Language-name qualifiers that derive_language may leave attached (e.g.
+# 'Tibetan Otani', 'ABC India'). When an exact match fails, the resolver retries
+# on the first word so these still resolve. 'ABC' is Apple's generic Latin
+# layout family -- not a language -- so it maps to its base script (English).
+_LANGUAGE_ALIASES = {
+    'ABC':       ('eng', 'US', 'en'),
+    'ABC India': ('eng', 'US', 'en'),
+}
+
+
+def language_iso_codes(language: str) -> 'tuple | None':
+    """Return (iso639, iso3166, short_label) for a language name, or None.
+
+    Tries an exact match, then known aliases, then the first word of the name (so
+    qualified names like 'Tibetan Otani' resolve via 'Tibetan'). None means the
+    language is unknown, so the registry omits the country/language/short elements
+    rather than guess -- a missing flag is preferable to a wrong country's flag.
+    Note iso3166 may itself be None for a known language with no single country;
+    callers must treat 'no tuple' and 'tuple with None country' the same for the
+    flag (both mean no flag) while still using the language code for grouping.
+    """
+
+    if language in _LANGUAGE_ISO:
+        return _LANGUAGE_ISO[language]
+    if language in _LANGUAGE_ALIASES:
+        return _LANGUAGE_ALIASES[language]
+    first_word = language.split(' ')[0] if language else ''
+    if first_word and first_word in _LANGUAGE_ISO:
+        return _LANGUAGE_ISO[first_word]
+    return None
 
 
 def group_by_language(records: 'list') -> 'dict':

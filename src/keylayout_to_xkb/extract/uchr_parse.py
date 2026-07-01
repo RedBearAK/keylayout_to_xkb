@@ -15,18 +15,21 @@ we fail loud rather than parse garbage.
 """
 
 import struct
-import unicodedata
 
 from keylayout_to_xkb.common.debug import dbg, warn, hex_window
 from keylayout_to_xkb.common.models import (
     Layout,
+    Variant,
     DeadState,
     KeyOutput,
     OutputKind,
     ModifierState,
 )
-from keylayout_to_xkb.common.mac_virtual_keys import vk_name
 from keylayout_to_xkb.extract.uckeytranslate import resolve_plane_tables_via_os
+from keylayout_to_xkb.common.gestalt_keyboard import (
+    lowest_generic_type,
+    representative_type_for_kind,
+)
 
 
 __version__ = '20260623'
@@ -51,20 +54,6 @@ _RANGE_ENTRY_FORMAT        = 0x0002
 
 _MOD_MAP_MARKER            = 0x3001
 
-# Modifier-index bits that mark a non-character plane on Linux: cmd (0x01) and
-# control (0x10). A table reachable only with one of these set carries shortcut
-# or control output, not characters we port.
-_MOD_CMD_OR_CONTROL        = 0x11
-
-# A plane-sanity gap of at least this many distinct printable outputs is flagged
-# as major (typically a whole missed script); fewer is minor (stray accents).
-_PLANE_GAP_MAJOR           = 10
-
-# A char table needs at least this many letters of a script to be considered a
-# substantial alphabet (used to decide a layout's primary script vs. a small
-# Latin shortcut/fallback layer on a non-Latin keyboard).
-_MIN_SCRIPT_LETTERS        = 10
-
 # macOS virtual keycodes of the number-row keys 1..0. The shift plane of a
 # standard layout differs from plain on these (digit -> symbol), which
 # disambiguates two otherwise-identical uppercase tables whose only difference
@@ -85,6 +74,155 @@ def _check_bounds(data: bytes, offset: int, length: int, what: str) -> None:
             f'{what}: out-of-bounds '
             f'(offset={offset}, length={length}, buffer={len(data)})'
         )
+
+
+def _read_keyboard_type_records(data: bytes, count: int) -> 'list[dict]':
+    """Read every keyboard-type record's range and section offsets.
+
+    Each record is 28 bytes: first, last (gestalt type range) then five section
+    offsets (modifier map, char index, state records, terminators, sequences).
+    Returns one dict per record.
+    """
+
+    records = []
+    for i in range(count):
+        base = 12 + i * 28
+        _check_bounds(data, base, 28, f'keyboard-type header[{i}]')
+        (first, last, mod, char_index, state_records,
+         terminators, sequences) = struct.unpack_from('<IIIIIII', data, base)
+        records.append({
+            'first': first, 'last': last,
+            'mod_to_table_offset': mod,
+            'char_index_offset': char_index,
+            'state_records_offset': state_records,
+            'state_terminators_offset': terminators,
+            'sequence_data_offset': sequences,
+        })
+    return records
+
+
+def _table_identity(record: 'dict') -> tuple:
+    """Full offset tuple identifying a record's physical layout.
+
+    Two records with the same tuple resolve to byte-identical key output, so
+    they are the same variant and emit once. Char-index plus modifier map plus
+    the dead-state offsets capture everything a variant's keys depend on.
+    """
+
+    return (
+        record['mod_to_table_offset'],
+        record['char_index_offset'],
+        record['state_records_offset'],
+        record['state_terminators_offset'],
+        record['sequence_data_offset'],
+    )
+
+
+def _resolve_kind_variants(data: bytes, records: 'list[dict]') -> 'list[dict]':
+    """Resolve the variant set: generic primary plus each advertised kind.
+
+    Returns an ordered list of {tag, record, type, range} dicts. The first is
+    the primary (tag ''), built from the lowest generic keyboard type (or, if a
+    layout advertises no kind-less type, the first record). Each ANSI/ISO/JIS
+    kind that the layout advertises a representative type for is appended with
+    its kind name as tag, UNLESS it resolves to a table already emitted by an
+    earlier entry -- kinds that share a physical table collapse to one variant,
+    keeping the earliest (primary, then ANSI, ISO, JIS) label.
+
+    Resolution is by gestalt type number, which the exhaustive type/table check
+    confirmed the OS honors for every named-kind type.
+    """
+
+    ranges = [(r['first'], r['last']) for r in records]
+
+    def covered(type_number):
+        return any(first <= type_number <= last for first, last in ranges)
+
+    def record_for(type_number):
+        for record in records:
+            if record['first'] <= type_number <= record['last']:
+                return record
+        return None
+
+    variants = []
+    seen_tables = set()
+
+    # Primary: the generic/default table (kind-less type), else first record.
+    generic_type = lowest_generic_type(ranges)
+    if generic_type is not None:
+        primary_record = record_for(generic_type)
+        primary_type = generic_type
+    else:
+        primary_record = records[0]
+        primary_type = records[0]['first']
+    variants.append({
+        'tag': '',
+        'record': primary_record,
+        'type': primary_type,
+        'range': (primary_record['first'], primary_record['last']),
+    })
+    seen_tables.add(_table_identity(primary_record))
+
+    # Each advertised kind, deduped against tables already emitted.
+    for kind in ('ANSI', 'ISO', 'JIS'):
+        type_number = representative_type_for_kind(kind, covered)
+        if type_number is None:
+            continue
+        record = record_for(type_number)
+        if record is None:
+            continue
+        identity = _table_identity(record)
+        if identity in seen_tables:
+            continue
+        seen_tables.add(identity)
+        variants.append({
+            'tag': kind.lower(),
+            'record': record,
+            'type': type_number,
+            'range': (record['first'], record['last']),
+        })
+
+    return variants
+
+
+def _build_variant_keys(
+    data: bytes,
+    record: 'dict',
+    state_records: 'list[dict]',
+    sequences: 'list[str]',
+) -> 'tuple[dict, dict]':
+    """Decode one variant's keys from its record.
+
+    Returns (keys, plane_tables): the fresh keys dict and the resolved
+    {ModifierState: char-table index} map for this variant (so the caller can
+    record it on the Variant for documentation-identity collapsing). Uses the
+    validated byte+2 plane resolution against the record's own char tables and
+    modifier map. Dead states are shared (passed in), not rebuilt.
+    """
+
+    char_tables = _parse_char_table_index(data, record['char_index_offset'])
+    table_map, default_table = _parse_modifier_table_map(
+        data, record['mod_to_table_offset']
+    )
+    plane_tables = _resolve_plane_tables(
+        data, char_tables, table_map, default_table,
+        state_records, sequences,
+    )
+    keys = {}
+    for modifier_state, table_index in plane_tables.items():
+        if table_index >= len(char_tables):
+            continue
+        table_offset, table_size = char_tables[table_index]
+        for virtual_key in range(table_size):
+            entry = struct.unpack_from('<H', data, table_offset + 2 * virtual_key)[0]
+            key_output = _entry_to_key_output(
+                entry, state_records, sequences,
+                virtual_key,
+            )
+            if key_output is None:
+                continue
+            keys.setdefault(virtual_key, {})[modifier_state] = key_output
+    return keys, plane_tables
 
 
 def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '') -> Layout:
@@ -137,8 +275,9 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '') -> Layou
         f'seq_data_off={sequence_data_offset}'
     )
 
+    all_records = _read_keyboard_type_records(data, keyboard_type_count)
     if keyboard_type_count > 1:
-        dbg('uchr', f'note: {keyboard_type_count} keyboard-type records; using [0]')
+        dbg('uchr', f'note: {keyboard_type_count} keyboard-type records')
 
     max_output_char_length = _parse_max_output_char_length(data, feature_info_offset)
     dbg('uchr', f'maxOutputCharLength={max_output_char_length}')
@@ -162,8 +301,6 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '') -> Layou
     #   (e.g. Rejang U+A946, Meetei Mayek U+ABxx), not an index.
     #
     # Both are format-declared facts, not inferences from index range.
-    state_indices_active = len(state_records) > 0
-    sequence_indices_active = max_output_char_length >= 2
 
     char_tables = _parse_char_table_index(data, char_index_offset)
     keys_per_table = char_tables[0][1] if char_tables else 0
@@ -179,7 +316,6 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '') -> Layou
     def table_outputs_for(table_index):
         return _table_outputs(
             data, char_tables[table_index], state_records, sequences,
-            state_indices_active, sequence_indices_active,
         )
 
     plane_tables = None
@@ -196,7 +332,7 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '') -> Layou
     else:
         plane_tables = _resolve_plane_tables(
             data, char_tables, table_map, default_table,
-            state_records, sequences, state_indices_active, sequence_indices_active,
+            state_records, sequences,
         )
         dbg('uchr', 'plane resolution: content-driven (fallback)')
     dbg(
@@ -208,29 +344,53 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '') -> Layou
     layout = Layout(name=layout_name, source_id=source_id or None)
 
     terminators = _parse_terminators(
-        data, state_terminators_offset, sequences, sequence_indices_active
+        data, state_terminators_offset, sequences
     )
     dbg('uchr', f'terminators: {len(terminators)}')
 
     _build_dead_states(
-        layout, state_records, sequences, sequence_indices_active, terminators
+        layout, state_records, sequences, terminators
     )
     dbg('uchr', f'dead states: {layout.dead_key_count()}')
 
     _populate_keys(
         layout, data, char_tables, plane_tables, state_records, sequences,
-        state_indices_active, sequence_indices_active,
     )
 
     _verify_plane_assignment(
         layout, data, char_tables, plane_tables, table_map, state_records,
-        sequences, state_indices_active, sequence_indices_active,
+        sequences,
     )
+
+    # Resolve the keyboard-type variant set (generic primary + advertised
+    # ANSI/ISO/JIS kinds that resolve to distinct physical tables). The primary
+    # carries the keys already populated above; additional kinds each become a
+    # self-contained Variant. Dead states are shared across all variants.
+    kind_variants = _resolve_kind_variants(data, all_records)
+    primary = kind_variants[0]
+    layout.variants.append(Variant(
+        tag='',
+        keys=layout.keys,
+        keyboard_type_range=primary['range'],
+        plane_tables=dict(plane_tables),
+    ))
+    for entry in kind_variants[1:]:
+        variant_keys, variant_plane_tables = _build_variant_keys(
+            data, entry['record'], state_records, sequences,
+        )
+        layout.variants.append(Variant(
+            tag=entry['tag'],
+            keys=variant_keys,
+            keyboard_type_range=entry['range'],
+            plane_tables=variant_plane_tables,
+        ))
+        dbg('uchr', f'variant {entry["tag"]!r}: keys={len(variant_keys)} '
+                    f'type={entry["type"]} range={entry["range"]}')
 
     dbg(
         'uchr',
         f'parsed: keys={len(layout.keys)} dead_states={layout.dead_key_count()} '
-        f'approx_chars={layout.char_count()}'
+        f'approx_chars={layout.char_count()} variants={len(layout.variants)}'
     )
 
     return layout
@@ -350,51 +510,18 @@ def _parse_modifier_table_map(data: bytes, offset: int) -> 'tuple[list[int], int
     return table_nums, default_table
 
 
-def _table_letters(
-    data: bytes,
-    table: 'tuple[int, int]',
-    state_records: 'list[dict]',
-    sequences: 'list[str]',
-    state_indices_active: bool,
-    sequence_indices_active: bool,
-) -> 'dict':
-    """Return {virtual_key: char} for alphabetic single-char outputs of a table.
-
-    Used only for plane classification, so dead keys and multi-char sequences
-    are skipped (they don't help judge script/case). Reads the same way the
-    populate path does, via _entry_to_key_output, then keeps only single
-    alphabetic characters.
-    """
-
-    table_offset, table_size = table
-    letters = {}
-    for virtual_key in range(table_size):
-        entry = struct.unpack_from('<H', data, table_offset + 2 * virtual_key)[0]
-        ko = _entry_to_key_output(
-            entry, state_records, sequences,
-            state_indices_active, sequence_indices_active, virtual_key,
-        )
-        if ko is None or ko.kind is not OutputKind.CHARS or not ko.output:
-            continue
-        if len(ko.output) == 1 and ko.output.isalpha():
-            letters[virtual_key] = ko.output
-    return letters
-
-
 def _table_outputs(
     data: bytes,
     table: 'tuple[int, int]',
     state_records: 'list[dict]',
     sequences: 'list[str]',
-    state_indices_active: bool,
-    sequence_indices_active: bool,
 ) -> 'dict':
     """Return {virtual_key: output_str} for ALL single-char outputs of a table.
 
-    Unlike _table_letters (alphabetic only), this keeps every single-character
-    output including symbols, so the UCKeyTranslate plane matcher can identify
-    symbol-heavy Option planes. Dead-key and multi-char cells are omitted (they
-    do not give a stable single-char key for matching).
+    Keeps every single-character output including symbols, so the UCKeyTranslate
+    plane matcher (the OS oracle path) can identify symbol-heavy Option planes.
+    Dead-key and multi-char cells are omitted (they do not give a stable
+    single-char key for matching).
     """
 
     table_offset, table_size = table
@@ -402,38 +529,13 @@ def _table_outputs(
     for virtual_key in range(table_size):
         entry = struct.unpack_from('<H', data, table_offset + 2 * virtual_key)[0]
         ko = _entry_to_key_output(
-            entry, state_records, sequences,
-            state_indices_active, sequence_indices_active, virtual_key,
+            entry, state_records, sequences, virtual_key,
         )
         if ko is None or ko.kind is not OutputKind.CHARS or not ko.output:
             continue
         if len(ko.output) == 1:
             outputs[virtual_key] = ko.output
     return outputs
-
-
-def _is_latin(ch: str) -> bool:
-    """True if ch is a Latin-script letter (by Unicode name prefix)."""
-
-    try:
-        return unicodedata.name(ch).startswith('LATIN')
-    except ValueError:
-        return False
-
-
-def _uppercase_pair_score(lower_letters: 'dict', upper_letters: 'dict') -> int:
-    """Count virtual keys where upper_letters is the uppercasing of lower_letters.
-
-    The signature of a shift plane relative to its base: same script, same
-    positions, cased up. Cross-script or same-case tables score zero.
-    """
-
-    score = 0
-    for vk, ch in lower_letters.items():
-        other = upper_letters.get(vk)
-        if other is not None and ch != other and other == ch.upper():
-            score += 1
-    return score
 
 
 def _resolve_plane_tables(
@@ -443,37 +545,54 @@ def _resolve_plane_tables(
     default_table: int,
     state_records: 'list[dict]',
     sequences: 'list[str]',
-    state_indices_active: bool,
-    sequence_indices_active: bool,
 ) -> 'dict':
-    """Map each ModifierState plane to its char-table index, by table CONTENT.
+    """Map each ModifierState plane to its char-table index via the modifier map.
 
-    The on-disk keyModifiersToTableNum index uses an undocumented compaction, so
-    rather than trust fixed indices, planes are resolved from what each table
-    outputs. Verified against Apple's own .keylayout XML (Ukelele) for US,
-    German, Greek, Ukrainian: this reproduces Apple's declared plane->table
-    assignment, including native-script layouts whose primary script the fixed
-    indices missed.
+    The plane's char table is keyModifiersToTableNum[plane_byte + 2], where
+    plane_byte is the standard Carbon modifierKeyState for the plane:
 
-    Algorithm:
-      1. Candidate planes are tables reachable WITHOUT command or control. Those
-         modifiers select shortcut/control layers (e.g. the Latin command layer
-         on a Cyrillic keyboard), which are not character planes on Linux.
-      2. If any candidate holds a substantial non-Latin script, the layout's
-         primary script is non-Latin; the Latin candidate(s) are a fallback/
-         shortcut layer and are demoted. Otherwise the primary script is Latin.
-      3. PLAIN is the primary-script candidate with the most lowercase letters
-         (or, for uncased scripts, the most letters). SHIFT is the candidate
-         that best reads as the uppercasing of PLAIN. OPTION and SHIFT_OPTION
-         are the remaining candidates, paired by the same uppercase relationship
-         where it holds, else by letter richness.
+        PLAIN              0x00  -> index 0x02
+        SHIFT              0x02  -> index 0x04
+        OPTION             0x08  -> index 0x0A
+        SHIFT_OPTION       0x0A  -> index 0x0C
+        CAPS               0x04  -> index 0x06
+        CAPS_SHIFT         0x06  -> index 0x08
+        CAPS_OPTION        0x0C  -> index 0x0E
+        CAPS_SHIFT_OPTION  0x0E  -> index 0x10
 
-    Falls back to physical order only when there is no modifier map at all.
+    The +2 offset is the transform UCKeyTranslate itself applies between the
+    modifier byte and the table index. It was extracted by exhaustively driving
+    the real UCKeyTranslate across every modifier byte on all 241 installed
+    macOS layouts and inverting its output against the raw array: index = byte+2
+    reproduces the OS plane->table selection on 228/241 layouts at 100% and
+    99.55% of all cells overall. The residual misses are NOT selection errors --
+    they are (a) ISO/JIS keyboard-type variant keys (vk50/vk94) and (b)
+    supplementary-plane codepoint decoding, both orthogonal to this mapping.
+
+    The caps quartet (caps bit 0x04) uses the SAME transform and decodes with the
+    same machinery; a caps-layer validation matched the OS at 99.96% across all
+    layouts. The caps tables carry genuinely-typeable output (e.g. Latin behind
+    caps on non-Latin layouts, unique caps+option symbols), captured WITHOUT
+    classifying caps behavior -- each caps plane simply reads whatever table its
+    byte+2 index points at.
+
+    This replaces the former content-heuristic resolver: with the transform
+    known, planes are read directly from the layout's own modifier map rather
+    than inferred from table contents, so non-Latin layouts (whose primary
+    script the old fixed indices missed) resolve correctly without script
+    detection.
+
+    Falls back to physical table order only when there is no modifier map.
     """
 
     table_count = len(char_tables)
 
     if not table_map:
+        # No modifier map: fall back to physical table order for the base four
+        # planes only. The caps quartet has no reliable order-based position, so
+        # it is omitted here rather than guessed -- omission is safe (those cells
+        # simply have no output), a wrong guess would mistype. Layouts with a
+        # modifier map (effectively all real ones) resolve caps via plane_index.
         fallback = {
             ModifierState.PLAIN:        0,
             ModifierState.SHIFT:        1,
@@ -485,166 +604,26 @@ def _resolve_plane_tables(
             if 0 <= ti < table_count
         }
 
-    reach = _modifier_reach_by_table(table_map)
-
-    def letters_of(table_index):
-        return _table_letters(
-            data, char_tables[table_index], state_records, sequences,
-            state_indices_active, sequence_indices_active,
-        )
-
-    # Step 1: candidate char-plane tables (reachable without cmd/control).
-    candidates = [
-        table_index for table_index in range(table_count)
-        if any(not (i & _MOD_CMD_OR_CONTROL) for i in reach.get(table_index, []))
-    ]
-    if not candidates:
-        return {}
-
-    letters_by_table = {t: letters_of(t) for t in candidates}
-
-    def nonlatin_count(t):
-        return sum(1 for ch in letters_by_table[t].values() if not _is_latin(ch))
-
-    def latin_count(t):
-        return sum(1 for ch in letters_by_table[t].values() if _is_latin(ch))
-
-    def lowercase_count(t):
-        return sum(1 for ch in letters_by_table[t].values() if ch.islower())
-
-    def letter_count(t):
-        return len(letters_by_table[t])
-
-    # Step 2: decide primary script. A layout is non-Latin if some candidate
-    # carries a substantial non-Latin alphabet; then Latin tables are demoted.
-    has_nonlatin = any(nonlatin_count(t) >= _MIN_SCRIPT_LETTERS for t in candidates)
-    if has_nonlatin:
-        primary = [t for t in candidates if nonlatin_count(t) >= latin_count(t)
-                   and nonlatin_count(t) > 0]
-    else:
-        primary = [t for t in candidates if latin_count(t) > 0]
-    pool = primary if primary else candidates
-
-    # Step 3: assign planes. Cased scripts (Latin, Greek, Cyrillic) are resolved
-    # by case relationship; uncased scripts (Tibetan, Thai, Rejang, ...) have no
-    # uppercase, so their planes are ordered by how few modifiers reach each
-    # table (fewest = most basic plane). The modifier index is used here only to
-    # ORDER same-script tables, never to decode which modifier it is, so the
-    # opaque on-disk index packing does not matter.
-    cased = any(lowercase_count(t) > 0 for t in pool)
-
-    plane_order = [
-        ModifierState.PLAIN,
-        ModifierState.SHIFT,
-        ModifierState.OPTION,
-        ModifierState.SHIFT_OPTION,
-    ]
-
-    if not cased:
-        # Uncased: primary-script tables, ordered by minimal non-cmd/control
-        # modifier index. Verified against Apple's Thai .keylayout (plain and
-        # shift are distinct Thai character sets, not a case pair) and the
-        # Tibetan/Rejang/Meetei binaries.
-        def min_char_index(t):
-            plain_indices = [i for i in reach.get(t, []) if not (i & _MOD_CMD_OR_CONTROL)]
-            return min(plain_indices) if plain_indices else None
-
-        script_pool = pool if pool else candidates
-        ordered = sorted(
-            (t for t in script_pool if min_char_index(t) is not None),
-            key=min_char_index,
-        )
-        resolved = {}
-        for plane, table_index in zip(plane_order, ordered):
-            resolved[plane] = table_index
-        return resolved
-
-    # Cased path.
-    plain = max(pool, key=lambda t: (lowercase_count(t), letter_count(t)))
-    plain_letters = letters_by_table[plain]
-
-    def number_row(table_index):
-        """Raw output of the number-row keys for a table, for tiebreaking."""
-        table_offset, table_size = char_tables[table_index]
-        row = []
-        for vk in _NUMBER_ROW_VKS:
-            if vk >= table_size:
-                row.append('')
-                continue
-            entry = struct.unpack_from('<H', data, table_offset + 2 * vk)[0]
-            ko = _entry_to_key_output(
-                entry, state_records, sequences,
-                state_indices_active, sequence_indices_active, vk,
-            )
-            row.append(ko.output if (ko and ko.kind is OutputKind.CHARS) else '')
-        return row
-
-    plain_numbers = number_row(plain)
-
-    def number_row_shifted(table_index):
-        """How many number-row keys differ from plain (digit -> symbol).
-
-        The shift plane of a standard layout shifts the number row; a near-
-        duplicate table that leaves digits unchanged does not. Used only to
-        break ties between tables with equal letter-pairing scores.
-        """
-        row = number_row(table_index)
-        return sum(
-            1 for a, b in zip(plain_numbers, row)
-            if a and b and a != b
-        )
-
-    # SHIFT: the table that best reads as the shifted plane of plain. Score is
-    # uppercase letter-pairing PLUS number-row shifting (digit -> symbol), since
-    # two tables can tie on letters and differ only on whether they shift the
-    # number row (Greek Polytonic has two Greek-caps tables, 1234 vs !@#$). The
-    # number-row term is weighted to break such near-ties decisively without
-    # overriding a genuine letter-pairing difference on non-number-shifting
-    # layouts (where every candidate scores 0 on the number-row term).
-    shift_candidates = [t for t in candidates if t != plain]
-    shift = None
-    if shift_candidates:
-        def shift_score(table_index):
-            return (
-                _uppercase_pair_score(plain_letters, letters_by_table[table_index])
-                + number_row_shifted(table_index)
-            )
-        best = max(shift_candidates, key=shift_score)
-        if _uppercase_pair_score(plain_letters, letters_by_table[best]) > 0:
-            shift = best
-
-    # OPTION / SHIFT_OPTION: remaining candidates, paired by uppercase
-    # relationship where present, else by letter richness.
-    claimed = {plain}
-    if shift is not None:
-        claimed.add(shift)
-    rest = [t for t in candidates if t not in claimed]
-    option = shift_option = None
-    if rest:
-        best_pair = None
-        for low in rest:
-            for high in rest:
-                if low == high:
-                    continue
-                score = _uppercase_pair_score(letters_by_table[low], letters_by_table[high])
-                if score > 0 and (best_pair is None or score > best_pair[0]):
-                    best_pair = (score, low, high)
-        if best_pair is not None:
-            option, shift_option = best_pair[1], best_pair[2]
-        else:
-            ranked = sorted(rest, key=letter_count, reverse=True)
-            option = ranked[0]
-            shift_option = ranked[1] if len(ranked) > 1 else None
+    # plane -> (modifier byte + 2) index into keyModifiersToTableNum.
+    plane_index = {
+        ModifierState.PLAIN:             0x00 + 2,
+        ModifierState.SHIFT:             0x02 + 2,
+        ModifierState.OPTION:            0x08 + 2,
+        ModifierState.SHIFT_OPTION:      0x0A + 2,
+        ModifierState.CAPS:              0x04 + 2,
+        ModifierState.CAPS_SHIFT:        0x06 + 2,
+        ModifierState.CAPS_OPTION:       0x0C + 2,
+        ModifierState.CAPS_SHIFT_OPTION: 0x0E + 2,
+    }
 
     resolved = {}
-    if plain is not None:
-        resolved[ModifierState.PLAIN] = plain
-    if shift is not None:
-        resolved[ModifierState.SHIFT] = shift
-    if option is not None:
-        resolved[ModifierState.OPTION] = option
-    if shift_option is not None:
-        resolved[ModifierState.SHIFT_OPTION] = shift_option
+    for plane, index in plane_index.items():
+        if 0 <= index < len(table_map):
+            table_index = table_map[index]
+        else:
+            table_index = default_table
+        if 0 <= table_index < table_count:
+            resolved[plane] = table_index
     return resolved
 
 
@@ -695,7 +674,6 @@ def _parse_terminators(
     data: bytes,
     offset: int,
     sequences: 'list[str]',
-    sequence_indices_active: bool,
 ) -> 'list[str]':
     """Read keyStateTerminators; return the bare output per dead-key state.
 
@@ -708,7 +686,7 @@ def _parse_terminators(
     key has no composition in that state (e.g. the acute dead key followed by
     space yields a bare identical-character). The entry uses the same encoding
     as char-table and state charData: literal codepoint, sequence index when
-    sequence_indices_active, or empty. The list is indexed by state, parallel to
+    or empty. The list is indexed by state, parallel to
     the state records.
     """
 
@@ -736,7 +714,7 @@ def _parse_terminators(
     for i in range(count):
         entry = struct.unpack_from('<H', data, offset + 4 + 2 * i)[0]
         terminators.append(
-            _resolve_char_data(entry, sequences, sequence_indices_active)
+            _resolve_char_data(entry, sequences)
         )
     return terminators
 
@@ -883,24 +861,41 @@ def _parse_range_record_entries(
 def _resolve_char_data(
     char_data: int,
     sequences: 'list[str]',
-    sequence_indices_active: bool,
 ) -> str:
-    """Turn a state-entry charData into an output string.
+    """Resolve a 16-bit output reference into its output string.
 
-    A 0x8000-flagged value is a sequence index only when sequence_indices_active
-    (the layout declares maxOutputCharLength >= 2). Otherwise the high bit is
-    part of a literal codepoint. Values with both high bits set (0xC000) are
-    always literal high codepoints.
+    This is the single output-reference grammar the 'uchr' format uses wherever
+    it specifies output -- char-table entry literals, state-record 'zero' and
+    'entries' values, and terminators. The top two bits select the kind:
+
+      0xFFFE / 0xFFFF    -> empty (no output)
+      0x8000 + in-range  -> sequence index into the sequence table
+      0x8000 + oor       -> literal high codepoint (the high bit is data, not a
+                            flag; e.g. Rejang U+A946, Meetei Mayek U+ABxx)
+      0xC000             -> literal high codepoint (both bits are data)
+      otherwise          -> literal BMP codepoint
+
+    The discriminator between "sequence reference" and "literal high codepoint"
+    is whether the index lands IN RANGE of the sequence table, NOT the layout's
+    maxOutputCharLength flag. This was established for char-table entries (the
+    SMP fix) and proven by probe to hold identically at every output site:
+    'entries' alone holds ~22% flagged sequence references across layouts, and
+    the out-of-range cases (Rejang terminators) are genuine literals.
+
+    The 0x4000 (state) flag is NOT an output reference -- it only appears at the
+    char-table entry level as a dead-key trigger, handled by the caller. Any
+    0x4000 value reaching here is treated as a literal (an out-of-range state
+    index is a real high codepoint, same as the sequence case).
     """
 
     if char_data in (_OUTPUT_EMPTY_A, _OUTPUT_EMPTY_B):
         return ''
-    if sequence_indices_active and (char_data & _FLAG_TEST_MASK) == _FLAG_SEQUENCE:
+    if (char_data & _FLAG_TEST_MASK) == _FLAG_SEQUENCE:
         seq_index = char_data & _INDEX_MASK
         if 0 <= seq_index < len(sequences):
             return sequences[seq_index]
-        warn('uchr', f'sequence index {seq_index} out of range')
-        return ''
+        # flag bit set but out of range: the value is a literal high codepoint.
+        return chr(char_data)
     return chr(char_data)
 
 
@@ -908,7 +903,6 @@ def _build_dead_states(
     layout: Layout,
     state_records: 'list[dict]',
     sequences: 'list[str]',
-    sequence_indices_active: bool,
     terminators: 'list[str]',
 ) -> None:
     """Create DeadState objects and fill their compositions and terminators.
@@ -956,7 +950,7 @@ def _build_dead_states(
             if dead_state is None:
                 continue
             dead_state.compositions[base_char] = _resolve_char_data(
-                char_data, sequences, sequence_indices_active
+                char_data, sequences
             )
 
 
@@ -967,8 +961,6 @@ def _populate_keys(
     plane_tables: 'dict',
     state_records: 'list[dict]',
     sequences: 'list[str]',
-    state_indices_active: bool,
-    sequence_indices_active: bool,
 ) -> None:
     """Fill layout.keys, one modifier plane at a time.
 
@@ -984,7 +976,7 @@ def _populate_keys(
             entry = struct.unpack_from('<H', data, table_offset + 2 * virtual_key)[0]
             key_output = _entry_to_key_output(
                 entry, state_records, sequences,
-                state_indices_active, sequence_indices_active, virtual_key,
+                virtual_key,
             )
             if key_output is None:
                 continue
@@ -995,26 +987,32 @@ def _entry_to_key_output(
     entry: int,
     state_records: 'list[dict]',
     sequences: 'list[str]',
-    state_indices_active: bool,
-    sequence_indices_active: bool,
     virtual_key: int,
 ) -> 'KeyOutput | None':
     """Resolve one char-table entry into a KeyOutput (or None for empty).
 
-    The two index flags are governed independently:
+    A char-table entry uses the format's output-reference grammar, with one
+    addition (the 0x4000 state flag, which exists only at the entry level). Flag
+    interpretation is governed by INDEX VALIDITY, not by per-layout "active"
+    booleans -- the booleans were an approximation that proved wrong for both
+    flags (SMP sequence layouts with maxOutputCharLength == 1; Manipuri state
+    entries with zero state records):
 
-      0x4000 (state index) is honored when state_indices_active, i.e. the layout
-      has state records. Single-character layouts with dead keys (German,
-      Polish, Turkish, ...) rely on this even though they have no sequences.
+      0x8000 (sequence) + in-range  -> sequence index into the sequence table.
+      0x8000 + out-of-range         -> literal high codepoint (the high bit is
+                                       data; e.g. Rejang U+A946, Meetei Mayek
+                                       U+ABxx).
 
-      0x8000 (sequence index) is honored only when sequence_indices_active, i.e.
-      maxOutputCharLength >= 2. Otherwise the high bit belongs to a literal
-      codepoint (Rejang U+A946, Meetei Mayek U+ABxx).
+      0x4000 (state) + in-range     -> references a state record: either a dead
+                                       key (enters record['next']) or a direct
+                                       ground-state output (record['zero'],
+                                       itself resolved through the output-
+                                       reference grammar).
+      0x4000 + out-of-range         -> NOT a literal: the OS emits nothing, so
+                                       this returns None (empty).
 
-    The 0xC000 (both-bits) case is always a literal high codepoint (ligatures,
-    Apple private-use). When a flag is active but the index lands out of range,
-    the entry falls back to a literal codepoint and is surfaced via a warning,
-    since that indicates a real structural surprise rather than ordinary data.
+      0xC000 (both bits)            -> literal high codepoint (ligatures, Apple
+                                       private-use).
     """
 
     if entry in (_OUTPUT_EMPTY_A, _OUTPUT_EMPTY_B):
@@ -1022,18 +1020,38 @@ def _entry_to_key_output(
 
     masked = entry & _FLAG_TEST_MASK
 
-    if masked == _FLAG_SEQUENCE and sequence_indices_active:
+    if masked == _FLAG_SEQUENCE:
         seq_index = entry & _INDEX_MASK
+        # A 0x8000-flagged entry is a sequence index when that index actually
+        # lands within the sequence table; otherwise the high bit is part of a
+        # literal high-BMP codepoint, not an index. This in-range test, NOT the
+        # maxOutputCharLength>=2 flag, is the correct discriminator:
+        #   - Wancho/Adlam/Pahawh/Osage/Hanifi: maxOut==1, yet entries 0x8000..
+        #     ARE sequence indices into a populated table holding supplementary-
+        #     plane codepoints (U+1E2CE etc., decoded from their UTF-16 surrogate
+        #     pairs by the sequence parser).
+        #   - Rejang U+A946 / Meetei Mayek U+ABxx: maxOut==1, NO sequence table;
+        #     the 0x8000-bit value is a literal codepoint whose would-be index is
+        #     far out of range, so it correctly falls through to the literal.
+        # For maxOut>=2 layouts this returns the same result as the former
+        # sequence_indices_active gate (their sequence entries are in range,
+        # their literals are not), so no currently-passing layout regresses.
         if 0 <= seq_index < len(sequences):
             return KeyOutput(kind=OutputKind.CHARS, output=sequences[seq_index])
-        warn('uchr', f'{vk_name(virtual_key)} sequence index {seq_index} out of range')
         return KeyOutput(kind=OutputKind.CHARS, output=chr(entry))
 
-    if masked == _FLAG_STATE and state_indices_active:
+    # State flag (0x4000): the entry references a state record by index.
+    # Interpretation is governed by index validity, not by a per-layout "active"
+    # boolean (same principle as the sequence flag). A 0x4000 entry whose index
+    # is out of range is NOT a literal codepoint -- unlike the sequence case --
+    # the OS emits nothing for it (e.g. Manipuri Meetei Mayek, which has zero
+    # state records yet carries 0x4000/0x4001 placeholder entries). The full
+    # parser-vs-oracle validation across all layouts confirms this rule.
+    if masked == _FLAG_STATE:
         state_index = entry & _INDEX_MASK
         if state_index < len(state_records):
             record = state_records[state_index]
-            if record['zero'] == _OUTPUT_EMPTY_B:
+            if record['zero'] in (_OUTPUT_EMPTY_A, _OUTPUT_EMPTY_B):
                 # A dead-key record activates the state given by its 'next'
                 # field; dead states are keyed by that state number so that
                 # compositions and terminators line up.
@@ -1052,9 +1070,17 @@ def _entry_to_key_output(
                     kind=OutputKind.DEAD,
                     dead_state_name=str(record['next']),
                 )
-            return KeyOutput(kind=OutputKind.CHARS, output=chr(record['zero']))
-        warn('uchr', f'{vk_name(virtual_key)} state index {state_index} out of range')
-        return KeyOutput(kind=OutputKind.CHARS, output=chr(entry))
+            # 'zero' is the ground-state OUTPUT, encoded with the same output-
+            # reference grammar as a char-table entry: it may be a sequence
+            # index (Tibetan/Vietnamese), not a raw codepoint, so resolve it
+            # through the shared primitive rather than chr()-ing it.
+            return KeyOutput(
+                kind=OutputKind.CHARS,
+                output=_resolve_char_data(record['zero'], sequences),
+            )
+        # 0x4000 flag set but index out of range: not a literal high codepoint
+        # (the sequence case is) -- the OS produces no output, so emit nothing.
+        return None
 
     return KeyOutput(kind=OutputKind.CHARS, output=chr(entry))
 
@@ -1065,31 +1091,6 @@ def _entry_to_key_output(
 _SANITY_LETTER_VKS = (0x00, 0x01, 0x02, 0x03)
 
 
-def _modifier_reach_by_table(table_map: 'list[int]') -> 'dict':
-    """Invert keyModifiersToTableNum: table index -> list of modifier indices.
-
-    Lets the sanity check ask, for a given char table, which modifier
-    combinations reach it (so cmd/control-only tables can be treated as
-    non-character planes).
-    """
-
-    reach = {}
-    for modifier_index, table_index in enumerate(table_map):
-        reach.setdefault(table_index, []).append(modifier_index)
-    return reach
-
-
-# Control characters and the empty string never count as "printable content"
-# that a plane would be expected to carry.
-def _is_printable_output(text: str) -> bool:
-    """True if text has at least one non-control, non-space printable char."""
-
-    for ch in text:
-        if ch.isprintable() and not ch.isspace():
-            return True
-    return False
-
-
 def _verify_plane_assignment(
     layout: Layout,
     data: bytes,
@@ -1098,8 +1099,6 @@ def _verify_plane_assignment(
     table_map: 'list[int]',
     state_records: 'list[dict]',
     sequences: 'list[str]',
-    state_indices_active: bool,
-    sequence_indices_active: bool,
 ) -> None:
     """Sanity-check the resolved modifier planes against the raw tables.
 
@@ -1150,86 +1149,6 @@ def _verify_plane_assignment(
             'modifier-plane resolution may be wrong'
         )
 
-    # Check 2: scan tables NOT chosen for a plane. A table reachable only with
-    # cmd or control set is not a character plane on Linux (those are shortcut
-    # modifiers), so its content is expected to be unmapped and is ignored here.
-    # A table reachable WITHOUT cmd/control that carries printable output absent
-    # from all four planes is a real gap: the port would drop characters the
-    # user can type with shift/option/companion alone. The most consequential
-    # case is native-script layouts (Greek, Cyrillic, Tibetan, ...) whose primary
-    # script sits behind the 0x02 companion bit; the fixed plane query indices,
-    # which are correct for Latin layouts, resolve those to a Latin fallback
-    # table and miss the native alphabet. This is a known limitation of the
-    # fixed-index plane resolution, surfaced rather than hidden.
-    covered = set()
-    for plane in plane_tables:
-        for vk in range(char_tables[plane_tables[plane]][1]):
-            ko = layout.keys.get(vk, {}).get(plane)
-            if ko is not None and ko.kind is OutputKind.CHARS and ko.output:
-                covered.add(ko.output)
-
-    # Characters reachable via dead-key composition are NOT lost by the four-
-    # plane port: they go into the XCompose file and remain typeable as accent
-    # sequences. So a character absent from the planes but present as a
-    # composition result is fine; only a character on NO plane AND in NO
-    # composition is a genuine gap (e.g. a character on a Caps+Option layer the
-    # four-plane model does not capture). We separate the two so the warning
-    # reflects reality instead of alarming about compose-available characters.
-    composable = set()
-    for dead_state in layout.dead_states.values():
-        for result in dead_state.compositions.values():
-            if result:
-                composable.add(result)
-
-    chosen_tables = set(plane_tables.values())
-    reach = _modifier_reach_by_table(table_map)
-    missed_outputs = set()
-    for table_index, (table_offset, table_size) in enumerate(char_tables):
-        if table_index in chosen_tables:
-            continue
-        reaching_indices = reach.get(table_index, [])
-        # Benign if every reaching modifier index has cmd (0x01) or control
-        # (0x10) set; those are not character planes.
-        if reaching_indices and all(
-            (index & _MOD_CMD_OR_CONTROL) for index in reaching_indices
-        ):
-            continue
-        for vk in range(table_size):
-            entry = struct.unpack_from('<H', data, table_offset + 2 * vk)[0]
-            ko = _entry_to_key_output(
-                entry, state_records, sequences,
-                state_indices_active, sequence_indices_active, vk,
-            )
-            if ko is None or ko.kind is not OutputKind.CHARS or not ko.output:
-                continue
-            if not _is_printable_output(ko.output):
-                continue
-            if ko.output not in covered:
-                missed_outputs.add(ko.output)
-
-    # Split: compose-available (informational) vs genuinely unreachable (real).
-    via_compose = {ch for ch in missed_outputs if ch in composable}
-    unreachable = missed_outputs - composable
-
-    if via_compose:
-        sample = ' '.join(sorted(via_compose)[:12])
-        dbg(
-            'uchr',
-            f'plane note: {len(via_compose)} character(s) are not on a direct '
-            f'plane but remain typeable via dead-key composition (XCompose): '
-            f'{sample}'
-        )
-
-    if unreachable:
-        sample = ' '.join(sorted(unreachable)[:12])
-        severity = 'major' if len(unreachable) >= _PLANE_GAP_MAJOR else 'minor'
-        warn(
-            'uchr',
-            f'plane sanity ({severity}): {len(unreachable)} printable '
-            f'output(s) are on NO direct plane and in NO composition, so the '
-            f'four-plane port cannot type them (e.g. a Caps+Option layer): '
-            f'{sample}'
-        )
 
 
 # End of file #

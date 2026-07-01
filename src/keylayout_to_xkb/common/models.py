@@ -46,13 +46,28 @@ __version__ = '20260623'
 class ModifierState(enum.Enum):
     """The modifier planes we port.
 
-    macOS 'uchr' (and a .keylayout modifierMap) can select many more tables
-    than this, but a faithful Option-layer port needs only these four planes;
-    the command/control/caps tables are shortcut and lock layers handled by the
-    desktop, not by the layout (see the resolver in uchr_parse.py).
+    macOS 'uchr' (and a .keylayout modifierMap) can select many more tables than
+    this, but only EIGHT carry user-typeable character output: the four base
+    planes (no caps) and the four caps planes (caps held/locked). Both quartets
+    are faithful mirrors of what UCKeyTranslate produces, and both decode with
+    the same machinery (verified against the OS oracle at ~99.96% on the caps
+    quartet across all layouts).
+
+    The command and control tables are deliberately NOT planes here: probing
+    their contents showed the control tables hold C0 control characters
+    (Ctrl+A = U+0001, ...) and the command tables hold the Latin shortcut layer
+    (so Cmd+key shortcuts work regardless of script). Both are desktop/modifier
+    behavior Linux handles natively, not document-typeable content, so capturing
+    them as levels would break Control/Super handling (see the resolver and the
+    caps notes in uchr_parse.py / KNOWN_LIMITATIONS.md).
+
+    The caps quartet is captured WITHOUT classifying "caps behavior": a full-set
+    scan found 16 distinct caps table-reuse fingerprints, not two clean modes, so
+    the decode simply follows the groove -- reading whatever table each caps
+    plane points at and emitting it at its level, uniform across all layouts.
 
     UNKNOWN is reserved, NOT currently produced. The content-driven resolver
-    assigns every plane it emits to one of the four real planes or omits the
+    assigns every plane it emits to one of the eight real planes or omits the
     table; it never yields UNKNOWN. It is kept as an explicit sentinel so that a
     future parser MAY mark "a table that should be a plane but could not be
     classified" rather than dropping it silently. If you start producing
@@ -60,11 +75,15 @@ class ModifierState(enum.Enum):
     it reach output.
     """
 
-    PLAIN           = 'plain'
-    SHIFT           = 'shift'
-    OPTION          = 'option'
-    SHIFT_OPTION    = 'shift_option'
-    UNKNOWN         = 'unknown'
+    PLAIN               = 'plain'
+    SHIFT               = 'shift'
+    OPTION              = 'option'
+    SHIFT_OPTION        = 'shift_option'
+    CAPS                = 'caps'
+    CAPS_SHIFT          = 'caps_shift'
+    CAPS_OPTION         = 'caps_option'
+    CAPS_SHIFT_OPTION   = 'caps_shift_option'
+    UNKNOWN             = 'unknown'
 
 
 class OutputKind(enum.Enum):
@@ -226,16 +245,21 @@ class Variant:
     name and XKB variant name (e.g. '' for the primary/ANSI-ISO, 'jis' for
     JIS). 'keys' has the same shape and contract as Layout.keys.
 
-    NOTE: variant support is modelled here but the binary parser currently
-    populates only the primary variant; multi-variant parsing is the next
-    structural task. Until then a layout has exactly one Variant. Keep this
-    field populated even for single-variant layouts so consumers have a uniform
-    shape.
+    'plane_tables' records which char-table index each ModifierState plane
+    resolved to (the layout's own modifier-map routing). It is authoritative for
+    detecting when two planes are documentation-identical: macOS routes, say,
+    Caps+Shift to the very same table as Shift when caps adds nothing there, so
+    plane_tables[CAPS_SHIFT] == plane_tables[SHIFT]. Consumers (the doc generator
+    and potentially the emitter) use this to collapse redundant planes without
+    comparing outputs cell-by-cell. It is the resolved index, NOT the raw
+    modifier byte. May be empty if a parser cannot determine it (then consumers
+    fall back to treating every populated plane as distinct).
     """
 
     tag:                str
     keys:               'dict[int, dict[ModifierState, KeyOutput]]' = field(default_factory=dict)
     keyboard_type_range: 'tuple[int, int] | None' = None  # gestalt first..last, if known
+    plane_tables:       'dict[ModifierState, int]' = field(default_factory=dict)
 
 
 @dataclass

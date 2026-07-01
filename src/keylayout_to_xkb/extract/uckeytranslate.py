@@ -45,6 +45,23 @@ from keylayout_to_xkb.common.models import ModifierState
 __version__ = '20260623'
 
 
+def _utf16_units_to_str(out_buffer, length: int) -> str:
+    """Combine a UCKeyTranslate UniChar (UTF-16) unit array into a Python str.
+
+    UCKeyTranslate returns UTF-16 code units. A supplementary-plane codepoint
+    (Wancho, Adlam, Pahawh, ...) arrives as a surrogate PAIR of two units, so the
+    units must be decoded as UTF-16 -- decoding per-unit with chr() would leave
+    lone surrogates instead of the real codepoint. Packing to little-endian bytes
+    and decoding as utf-16-le combines the pair correctly.
+    """
+
+    raw = bytes()
+    for i in range(length):
+        unit = out_buffer[i]
+        raw += bytes((unit & 0xFF, (unit >> 8) & 0xFF))
+    return raw.decode('utf-16-le')
+
+
 _HITOOLBOX_PATH = (
     '/System/Library/Frameworks/Carbon.framework/Versions/A/'
     'Frameworks/HIToolbox.framework/Versions/A/HIToolbox'
@@ -160,7 +177,7 @@ def _translate(handle, layout_ptr, kbd_type, virtual_key, modifier_byte):
     if actual_len.value == 0 and dead_key_state.value != 0:
         return None  # dead key: entered a state, produced nothing yet
 
-    return ''.join(chr(out_buffer[i]) for i in range(actual_len.value))
+    return _utf16_units_to_str(out_buffer, actual_len.value)
 
 
 def resolve_plane_tables_via_os(
@@ -292,7 +309,7 @@ def _translate_full(handle, layout_ptr, kbd_type, virtual_key, modifier_byte):
     )
     if status != 0:
         return '', 0
-    output = ''.join(chr(out_buffer[i]) for i in range(actual_len.value))
+    output = _utf16_units_to_str(out_buffer, actual_len.value)
     return output, dead_key_state.value
 
 
@@ -315,7 +332,7 @@ def _compose_after(handle, layout_ptr, kbd_type, dead_state, base_vk, base_mod):
     )
     if status != 0:
         return ''
-    return ''.join(chr(out_buffer[i]) for i in range(actual_len.value))
+    return _utf16_units_to_str(out_buffer, actual_len.value)
 
 
 def build_os_reference(data: bytes) -> 'dict':
