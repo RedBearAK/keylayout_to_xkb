@@ -327,22 +327,23 @@ _LANGUAGE_TO_BASE_LAYOUT = {
 
 
 def base_layout_for_language(iso639: str, symbols_dir=None) -> str:
-    """Return the system base layout to register a variant under.
+    """Return the xkeyboard-config base layout name to register a variant under.
 
-    Maps the primary language to its xkeyboard-config base layout name, but only
-    if that base actually exists in symbols_dir (default the system XKB symbols
-    directory). Falls back to 'us' when the language has no mapping or the mapped
-    base is not installed -- 'us' always exists, so the layout stays selectable.
+    Resolves purely from the language->base map (data, not filesystem). This is
+    deliberately NOT gated on the base file existing, because the installer is
+    generated on macOS -- where /usr/share/X11/xkb/symbols does not exist -- but
+    RUNS on Linux. An earlier version checked os.path.isfile() against the system
+    XKB dir at generation time; on the Mac that check failed for EVERY language,
+    so every layout silently fell back to 'us'. The map only ever contains real
+    xkeyboard-config base names, and the install-time validate-and-rollback on the
+    target machine catches the rare case where a base is genuinely absent.
+
+    Falls back to 'us' only when the language has no mapping at all (e.g. an
+    indigenous/minority language with no system base layout). symbols_dir is
+    accepted for backward compatibility but ignored.
     """
 
-    import os
-
-    if symbols_dir is None:
-        symbols_dir = '/usr/share/X11/xkb/symbols'
-    candidate = _LANGUAGE_TO_BASE_LAYOUT.get(iso639)
-    if candidate and os.path.isfile(os.path.join(symbols_dir, candidate)):
-        return candidate
-    return 'us'
+    return _LANGUAGE_TO_BASE_LAYOUT.get(iso639, 'us')
 
 
 # End of file #

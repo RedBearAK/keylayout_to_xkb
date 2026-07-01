@@ -81,9 +81,24 @@ _XKB_KEYCODE = {
 
 
 def _load_xkb():
-    """Resolve the libxkbcommon entry points the probe uses."""
+    """Resolve the libxkbcommon entry points the probe uses.
 
-    lib = ctypes.CDLL(ctypes.util.find_library('xkbcommon'))
+    This probe validates the RIGHT side of the conversion -- the emitted XKB and
+    XCompose run through the real XKB stack -- so it requires libxkbcommon, which
+    exists on Linux, not macOS. On a Mac (no libxkbcommon) it exits with a clear
+    message: run this probe on the Linux target instead, and run the
+    UCKeyTranslate oracle probes on the Mac.
+    """
+
+    libname = ctypes.util.find_library('xkbcommon')
+    lib = ctypes.CDLL(libname) if libname else None
+    if lib is None or not hasattr(lib, 'xkb_context_new'):
+        raise SystemExit(
+            'libxkbcommon not found. This probe runs the emitted XKB/XCompose '
+            'through the real XKB stack, which needs libxkbcommon (Linux). Run '
+            'it on the Linux target; the UCKeyTranslate oracle probes are the '
+            'ones that run on macOS.'
+        )
     lib.xkb_context_new.restype = ctypes.c_void_p
     lib.xkb_context_new.argtypes = [ctypes.c_int]
     lib.xkb_keymap_new_from_string.restype = ctypes.c_void_p
@@ -120,16 +135,19 @@ def _load_xkb():
 
 
 def _wrap_keymap(symbols_block: str) -> str:
-    """Wrap an emitted types+symbols block into a full compilable keymap."""
+    """Wrap an emitted symbols block into a full compilable keymap.
 
-    types_index = symbols_block.index('xkb_types')
+    The emitter now references STANDARD system types, so the keymap pulls in
+    'complete' for its types component (exactly what a desktop environment does)
+    rather than any custom types. The emitted block is symbols-only.
+    """
+
     symbols_index = symbols_block.index('xkb_symbols')
-    types_text = symbols_block[types_index:symbols_index].rstrip()
     syms_text = symbols_block[symbols_index:].rstrip()
     indent = '\n  '
     keymap = 'xkb_keymap {\n'
-    keymap += '  xkb_keycodes { include "evdev+aliases(qwerty)" };\n  '
-    keymap += types_text.replace('\n', indent) + '\n'
+    keymap += '  xkb_keycodes { include "evdev+aliases(qwerty)" };\n'
+    keymap += '  xkb_types { include "complete" };\n'
     keymap += '  xkb_compat { include "complete" };\n  '
     keymap += syms_text.replace('\n', indent) + '\n'
     keymap += '};\n'
@@ -221,26 +239,37 @@ def _xkb_output(lib, keymap, compose_table, keycode: int, level: int) -> 'str | 
 # Plane -> level_name label the emitter writes (the plane value).
 _PLANE_LABEL = {p: p.value for p in ModifierState}
 
+# Fixed level -> plane order, matching the emitter's _PLANE_LEVEL_ORDER. With
+# standard types, level N always corresponds to the Nth plane in this canonical
+# order (no custom level_name lines to parse).
+_LEVEL_PLANE_ORDER = [
+    ModifierState.PLAIN,
+    ModifierState.SHIFT,
+    ModifierState.OPTION,
+    ModifierState.SHIFT_OPTION,
+    ModifierState.CAPS,
+    ModifierState.CAPS_SHIFT,
+    ModifierState.CAPS_OPTION,
+    ModifierState.CAPS_SHIFT_OPTION,
+]
 
-def _level_planes(symbols_block: str, type_name: str) -> 'list':
-    """Parse a type's level_name lines to get the plane each level maps to.
 
-    Returns a list indexed by (level-1) of ModifierState, so we can align an
-    XKB level back to the plane it represents.
+def _level_planes(symbols_block: str, xkb_code: str) -> 'list':
+    """The plane each level maps to for a key, by its emitted symbol count.
+
+    The level->plane mapping is fixed (_LEVEL_PLANE_ORDER); a key exposes as many
+    levels as it has symbols in its row, so we return that many planes in order.
+    NoSymbol padding levels are included (their model cell will be None and skip).
     """
 
     import re
-    block_start = symbols_block.index('type "%s"' % type_name)
-    block = symbols_block[block_start:]
-    block = block[:block.index('};')]
-    planes = {}
-    for match in re.finditer(r'level_name\[Level(\d+)\]\s*=\s*"([^"]+)"', block):
-        level = int(match.group(1))
-        label = match.group(2)
-        for plane, value in _PLANE_LABEL.items():
-            if value == label:
-                planes[level] = plane
-    return [planes.get(i + 1) for i in range(max(planes) if planes else 0)]
+    match = re.search(
+        r'key <%s>\s*\{[^}]*?symbols\[Group1\]\s*=\s*\[([^\]]*)\]' % xkb_code,
+        symbols_block, re.S)
+    if not match:
+        return []
+    count = len([t for t in match.group(1).split(',') if t.strip()])
+    return _LEVEL_PLANE_ORDER[:count]
 
 
 def _key_type_map(symbols_block: str) -> 'dict':
@@ -286,7 +315,7 @@ def _check_layout(lib, name, data):
         virtual_key = inverse_vk.get(xkb_code)
         if virtual_key is None:
             continue
-        level_planes = _level_planes(symbols_block, type_by_code[xkb_code])
+        level_planes = _level_planes(symbols_block, xkb_code)
         for level_index, plane in enumerate(level_planes):
             if plane is None:
                 continue

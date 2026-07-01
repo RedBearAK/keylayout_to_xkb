@@ -207,16 +207,16 @@ def _report(report):
         print('Your existing keyboard configuration is untouched.')
         return
     if report['all_unchanged']:
-        print('Already up to date (nothing changed).')
-    else:
-        if report['added']:
-            print('Installed: %s' % ', '.join(report['added']))
-        if report['refreshed']:
-            print('Refreshed: %s' % ', '.join(report['refreshed']))
-        print('Files written under %s' % report['paths'].root)
+        print('Already up to date (nothing changed); no need to log out.')
+        return
+    if report['added']:
+        print('Installed: %s' % ', '.join(report['added']))
+    if report['refreshed']:
+        print('Refreshed: %s' % ', '.join(report['refreshed']))
+    print('Files written under %s' % report['paths'].root)
     print('')
-    print('IMPORTANT: log out and back in for the layout to appear in your')
-    print('keyboard settings picker (the compositor must rebuild its keymap).')
+    print('Some Linux desktop environments might require a log out to allow')
+    print('picking the new layout(s).')
 
 
 def _require_linux():
@@ -307,13 +307,13 @@ def main(argv):
         result = uninstall_one(argv[1], force=force)
         if result['removed'] is None:
             print('not installed: %s' % argv[1]); return 1
-        print('Removed %s (%d remain). Log out and back in.'
+        print('Removed %s (%d remain). Some desktops might need a log out.'
               % (result['removed'], result['installed_count'])); return 0
     if cmd == '--uninstall-all':
         result = uninstall_all()
         if result['removed']:
             print('Removed: %s' % ', '.join(result['removed']))
-            print('Log out and back in.')
+            print('Some Linux desktops might need a log out.')
         else:
             print('Nothing installed; nothing to remove.')
         return 0
@@ -359,9 +359,17 @@ def _pause(message='Press Enter to continue...'):
 
 def _page(text):
     """Show long text through the system pager (less/$PAGER), via the stdlib
-    pydoc pager, which falls back to plain printing when no pager exists."""
+    pydoc pager, which falls back to plain printing when no pager exists.
+
+    The pager (less) runs its OWN alternate-screen switch and, on quit, restores
+    the NORMAL screen -- which drops us out of the TUI's alternate buffer. Without
+    re-entering, the menu would then draw on the real screen and leave remnants
+    mixed with the prompt on exit. So re-assert our alternate screen right after
+    the pager returns, putting us back in the buffer the TUI's exit will restore.
+    """
 
     pydoc.pager(text)
+    _enter_screen()
 
 
 def _ask(prompt):
@@ -578,22 +586,25 @@ def _menu(force=False):
         while True:
             _clear()
             print('keylayout_to_xkb installer')
+            print('  generator %s · build %s'
+                  % (_GENERATOR_VERSION, _GENERATOR_BUILD))
+            print('  generated %s' % _GENERATED_AT)
             print('=' * 40)
-            print('%d layout(s) embedded.\n' % len(RECORDS))
-            print('  1) List layouts')
-            print('  2) Install layouts')
-            print('  3) Preview a layout')
-            print('  4) Manage installed layouts (uninstall)')
-            print('  5) Dump raw files (no install)')
+            print('%d layout(s) available in this installer.\n' % len(RECORDS))
+            print('  1) Install layouts onto this system')
+            print('  2) List layouts in this installer')
+            print('  3) Preview a layout in this installer')
+            print('  4) Manage layouts already installed on this system')
+            print('  5) Dump raw XKB files (no install)')
             print('  q) Quit')
             answer = _ask('\nChoice: ').lower()
 
             if answer in ('q', 'quit', 'exit', ''):
                 break
             if answer == '1':
-                _page(_list_text())
-            elif answer == '2':
                 _install_flow(force=force)
+            elif answer == '2':
+                _page(_list_text())
             elif answer == '3':
                 _preview_flow()
             elif answer == '4':
@@ -637,7 +648,7 @@ def _manage_flow(force=False):
             result = uninstall_all()
             _clear()
             print('Removed: %s' % ', '.join(result['removed']))
-            print('\nLog out and back in for the change to take effect.')
+            print('\nSome Linux desktops might need a log out to update the picker.')
         else:
             _clear()
             print('Cancelled.')
@@ -651,7 +662,7 @@ def _manage_flow(force=False):
             _clear()
             print('Removed %s (%d remain).'
                   % (result['removed'], result['installed_count']))
-            print('\nLog out and back in for the change to take effect.')
+            print('\nSome Linux desktops might need a log out to update the picker.')
         else:
             _clear()
             print('Cancelled.')
@@ -706,26 +717,94 @@ def _embedded_core_source() -> str:
     return '\n'.join(kept).strip('\n')
 
 
+def _module_versions():
+    """Collect the __version__ dates of the modules whose code shapes an
+    installer, as a readable composite like 'rc20260701/gen20260623/br20260623'.
+
+    Read defensively: a module missing __version__ contributes '00000000' so the
+    composite is always well-formed. runtime_core (rc) leads because it is the
+    embedded engine that most determines installer behavior.
+    """
+
+    import os as _os
+    import re as _re
+
+    def _ver(module_filename):
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        text = _read_text(_os.path.join(here, module_filename))
+        match = _re.search(r"__version__\s*=\s*'(\d{8})'", text or '')
+        return match.group(1) if match else '00000000'
+
+    return 'rc%s/gen%s/br%s' % (
+        _ver('runtime_core.py'), _ver('generate.py'), _ver('build_record.py'))
+
+
+def _read_text(path):
+    try:
+        with open(path, encoding='utf-8') as handle:
+            return handle.read()
+    except OSError:
+        return ''
+
+
+def _generator_stamp(code_body):
+    """Return (code_version, build_hash, generated_at) identifying the generation
+    of code that emitted an installer.
+
+    code_version is the human-readable composite of module dates. build_hash is a
+    short sha256 of the CODE body only (preamble + engine + UI) -- NOT the records
+    or timestamp -- so it is identical across installers built from the same code
+    but different layouts, and changes the moment any generator code changes.
+    generated_at is when this specific file was produced.
+    """
+
+    import hashlib as _hashlib
+    import datetime as _datetime
+
+    code_version = _module_versions()
+    build_hash = _hashlib.sha256(code_body.encode('utf-8')).hexdigest()[:8]
+    generated_at = _datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return code_version, build_hash, generated_at
+
+
 def generate_installer(records: 'list') -> str:
     """Return the full text of a self-contained installer file for the records.
 
     Assembled from three pieces: the preamble (shebang, docstring, imports), the
     shared engine source from runtime_core.py (so there is no drift from the host
     tool's logic), and the installer-only UI layer (menu, guards, argv handling).
-    Then the embedded RECORDS data literal and the launcher line. The records are
-    embedded as a JSON string parsed at startup, keeping the payload readable and
-    avoiding quoting hazards.
+    Then a generator stamp, the embedded RECORDS data literal, and the launcher
+    line. The records are embedded as a JSON string parsed at startup, keeping the
+    payload readable and avoiding quoting hazards.
+
+    The generator stamp (code version + build hash + timestamp) is computed over
+    the CODE body only, so any generator-code change shifts the hash while the
+    same code across different layouts keeps a stable hash -- making it obvious at
+    a glance (in the terminal and the menu) exactly which generation emitted a
+    given installer.
     """
 
     payload = [_record_to_dict(record) for record in records]
     data_blob = json.dumps(payload, ensure_ascii=False, indent=1)
 
+    # Assemble the CODE body first (preamble + engine + UI); hash that.
+    code_body = ''.join([
+        _RUNTIME_PREAMBLE, '\n\n\n',
+        _embedded_core_source(), '\n\n',
+        _RUNTIME_UI,
+    ])
+    code_version, build_hash, generated_at = _generator_stamp(code_body)
+
+    stamp_block = (
+        "\n\n# ---- generator stamp ----\n"
+        "_GENERATOR_VERSION = %r\n"
+        "_GENERATOR_BUILD = %r\n"
+        "_GENERATED_AT = %r\n"
+        % (code_version, build_hash, generated_at))
+
     parts = []
-    parts.append(_RUNTIME_PREAMBLE)
-    parts.append('\n\n\n')
-    parts.append(_embedded_core_source())
-    parts.append('\n\n')
-    parts.append(_RUNTIME_UI)
+    parts.append(code_body)
+    parts.append(stamp_block)
     parts.append('\n\n# ---- embedded layout records (data payload) ----\n')
     parts.append('_RECORDS_JSON = r"""\n')
     parts.append(data_blob)
@@ -736,6 +815,20 @@ def generate_installer(records: 'list') -> str:
     parts.append("    _r['variants'] = [tuple(v) for v in _r['variants']]\n")
     parts.append(_LAUNCHER)
     return ''.join(parts)
+
+
+def installer_stamp_line(records: 'list') -> str:
+    """The one-line stamp for the terminal at generation time (host tool prints
+    this alongside the 'wrote installer' message)."""
+
+    code_body = ''.join([
+        _RUNTIME_PREAMBLE, '\n\n\n',
+        _embedded_core_source(), '\n\n',
+        _RUNTIME_UI,
+    ])
+    code_version, build_hash, generated_at = _generator_stamp(code_body)
+    return 'generator %s · build %s · %s' % (
+        code_version, build_hash, generated_at)
 
 
 # End of file #

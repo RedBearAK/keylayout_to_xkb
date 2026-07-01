@@ -472,6 +472,7 @@ def main(argv: 'list[str] | None' = None) -> int:
         name = payload.get('name') or ''
         source_id = payload.get('source_id') or ''
         data = payload.get('data')
+        languages = payload.get('languages') or []
 
         if filter_substr is not None and (
             filter_substr not in name.lower()
@@ -485,7 +486,8 @@ def main(argv: 'list[str] | None' = None) -> int:
             continue
 
         try:
-            layout = parse_uchr(data, layout_name=name, source_id=source_id)
+            layout = parse_uchr(data, layout_name=name, source_id=source_id,
+                                languages=languages)
         except UchrParseError as error:
             failed += 1
             warn('main', f'parse failed for {name!r}: {error}')
@@ -534,7 +536,10 @@ def main(argv: 'list[str] | None' = None) -> int:
         if not built_records:
             warn('main', 'no layouts matched; nothing to put in the installer')
             return 1
-        from keylayout_to_xkb.install.generate import generate_installer
+        from keylayout_to_xkb.install.generate import (
+            generate_installer, installer_stamp_line,
+        )
+        _stamp = installer_stamp_line(built_records)
 
         if args.separate:
             # One installer per layout in an auto-named (or given) directory.
@@ -568,6 +573,7 @@ def main(argv: 'list[str] | None' = None) -> int:
                 f'({", ".join(written)})',
                 file=sys.stderr,
             )
+            print(f'  [{_stamp}]', file=sys.stderr)
             return 0
 
         # Single bundled installer.
@@ -587,6 +593,7 @@ def main(argv: 'list[str] | None' = None) -> int:
             f'({len(built_records)} layout(s): {ids})',
             file=sys.stderr,
         )
+        print(f'  [{_stamp}]', file=sys.stderr)
         return 0
 
     if parsed_count == 0:

@@ -43,12 +43,41 @@ class InstallPaths:
         self.symbols_dir = os.path.join(self.root, 'symbols')
         self.types_dir = os.path.join(self.root, 'types')
         self.rules_dir = os.path.join(self.root, 'rules')
-        self.symbols_file = os.path.join(self.symbols_dir, _NAMESPACE)
+        # Symbols now live in one file PER BASE LAYOUT, named '<base>-k2x' (e.g.
+        # 'pl-k2x'), so KDE's preview finds our variant sections inside a file
+        # named after the layout it is resolving -- while NOT shadowing the real
+        # system base (a user 'symbols/pl' would replace the system Polish layout;
+        # 'symbols/pl-k2x' is a distinct file that shadows nothing). The set of
+        # these files is dynamic, so symbols_file is gone; use symbols_file_for().
         self.types_file = os.path.join(self.types_dir, _NAMESPACE)
         self.rules_file = os.path.join(self.rules_dir, 'evdev')
         self.registry_file = os.path.join(self.rules_dir, 'evdev.xml')
         self.compose_file = os.path.join(self.root, 'Compose.%s' % _NAMESPACE)
         self.manifest_file = os.path.join(self.root, '%s.manifest.json' % _NAMESPACE)
+
+    def symbols_file_for(self, base_layout):
+        """Path to the per-base symbols file for a base layout ('pl' -> the file
+        symbols/pl-k2x)."""
+
+        return os.path.join(self.symbols_dir, k2x_base_name(base_layout))
+
+
+def k2x_base_name(base_layout):
+    """The namespaced base-layout name we register under: 'pl' -> 'plx'.
+
+    A distinct file/layout name so our variant sections are findable by KDE's
+    preview (which looks in symbols/<layout>) without shadowing the real system
+    base layout of the same language.
+
+    The tag is a SINGLE trailing character ('x'), not '-k2x': KDE truncates the
+    stored layout identity to a few characters (observed: 'pl-k2x' clipped to
+    'pl-' in kxkbrc DisplayNames), and a truncated name no longer matches our
+    rules -- so the compositor cannot resolve our types component and every key
+    collapses to level 1 (Shift/AltGr/CapsLock stop working). 'plx' is short
+    enough to survive the clip while staying distinct from the system 'pl'.
+    """
+
+    return '%sx' % (base_layout or 'us')
 
 
 def _read(path):
@@ -72,100 +101,84 @@ def _write_if_changed(path, content, force):
 def _split_variant_block(block_text):
     """Split an emitted variant block into (types_section, symbols_section).
 
-    The emitter produces 'xkb_types "v" {...}' followed by 'xkb_symbols "v" {...}'.
-    These MUST live in separate files: a symbols/ file may contain only
-    xkb_symbols sections (libxkbcommon aborts a symbols include the moment it
-    meets an xkb_types section -- "Include file of wrong type"), and the custom
-    types belong in a types/ file the rules pull in alongside the symbols.
+    The emitter now produces ONLY an 'xkb_symbols "v" {...}' block -- every key
+    references a STANDARD system type, so there is no custom xkb_types section to
+    carry. types_section is therefore empty. (Retained as a tuple for callers that
+    still distinguish the two components; the types file is written empty.)
     """
 
-    types_index = block_text.index('xkb_types')
     symbols_index = block_text.index('xkb_symbols')
-    return (block_text[types_index:symbols_index].rstrip(),
-            block_text[symbols_index:].rstrip())
+    types_part = block_text[:symbols_index].strip()
+    if not types_part.startswith('xkb_types'):
+        types_part = ''
+    return (types_part, block_text[symbols_index:].rstrip())
 
 
 def build_types_file(records):
-    """The types/ file: every variant's xkb_types section, in the managed region.
+    """The types/ file, now an EMPTY managed region.
 
-    The keys in the symbols file reference these custom types by name, so they
-    must be loadable as a types component. The rules map each layout/variant to
-    'complete+keylayout_to_xkb(variant)' so the system base types load first and
-    ours are added.
+    The emitter switched from custom key types (MAC_KEY_*) to STANDARD system
+    types (EIGHT_LEVEL etc.), which the 'complete' component already provides.
+    Desktop environments like KDE load the standard types automatically but do
+    NOT reliably load a layout's own custom types, which left every key stuck on
+    level 1. So we no longer define any types here. The file is still written (as
+    an empty managed region) and tracked for snapshot/rollback/uninstall so those
+    paths need no special-casing; a stale custom-types file from an older install
+    is overwritten to empty.
     """
 
-    lines = [_BEGIN, '']
-    for record in sorted(records, key=lambda r: r['identifier']):
-        for variant_name, block_text in record['variants']:
-            types_section, _symbols = _split_variant_block(block_text)
-            lines.append('// %s : %s' % (record['identifier'], variant_name))
-            lines.append(types_section)
-            lines.append('')
-    lines.append(_END)
-    lines.append('')
-    return '\n'.join(lines)
+    _ = records  # no custom types are emitted any more
+    return '\n'.join([_BEGIN, '', _END, ''])
 
 
-def build_symbols_file(records):
-    """The symbols/ file: ONLY xkb_symbols sections (no xkb_types -- those go in
-    the types/ file via build_types_file)."""
+def build_symbols_files(records):
+    """Return {base_layout: symbols_file_text}, one entry per distinct base.
 
-    lines = [_BEGIN, '']
-    for record in sorted(records, key=lambda r: r['identifier']):
-        for variant_name, block_text in record['variants']:
-            _types, symbols_section = _split_variant_block(block_text)
-            lines.append('// %s : %s' % (record['identifier'], variant_name))
-            lines.append(symbols_section)
-            lines.append('')
-    lines.append(_END)
-    lines.append('')
-    return '\n'.join(lines)
+    Each base's file (written to symbols/<base>-k2x) holds the xkb_symbols
+    sections for every variant of every record that resolves to that base. The
+    section name is the variant name (mac-k2x-ansi/iso), which is what KDE's
+    preview and the system rules wildcard look up as <base>-k2x(<variant>).
+    """
+
+    by_base = {}
+    for record in records:
+        base = record.get('base_layout') or 'us'
+        by_base.setdefault(base, []).append(record)
+
+    files = {}
+    for base in sorted(by_base):
+        lines = [_BEGIN, '']
+        for record in sorted(by_base[base], key=lambda r: r['identifier']):
+            for variant_name, block_text in record['variants']:
+                _types, symbols_section = _split_variant_block(block_text)
+                lines.append('// %s : %s' % (record['identifier'], variant_name))
+                lines.append(symbols_section)
+                lines.append('')
+        lines.append(_END)
+        lines.append('')
+        files[base] = '\n'.join(lines)
+    return files
 
 
 def build_rules_file(records):
-    """Rules mapping our namespaced variants UNDER existing base layouts.
+    """Rules overlay for the <base>x model.
 
-    Model (learned from KDE rejecting top-level custom layouts): instead of
-    registering 'polishpro' as its own layout -- which KDE collapses to its
-    language and then fails to load (looks for symbols/'polish') -- we register
-    each layout's variants under the real system base layout for its primary
-    language (Polish -> 'pl'). KDE finds the base's symbols/geometry/flag, and our
-    variant is selectable within it.
+    Our variant sections live in symbols/<base>x, named after the layout, so the
+    SYSTEM wildcard rule ('* layout variant = pc+%l%(v)') already resolves
+    <base>x(mac-k2x-ansi) to symbols/<base>x section mac-k2x-ansi. The keys now
+    reference STANDARD types from the system 'complete' component, so NO custom
+    types mapping is needed either -- the whole keymap resolves through the system
+    rules. All we must do is include the system ruleset so our registry's layout
+    is recognised.
 
-    Each record carries base_layout (e.g. 'pl', or 'us' fallback for languages
-    with no system base). Variant names are namespaced 'mac-k2x-*' so they can
-    NEVER collide with a system variant of that base (e.g. 'de' ships a 'mac'
-    variant already). Layering is REPLACE: 'pc+ns(variant)' with NO '+base', so
-    the keymap is exactly our layout with no base-layout keys bleeding through
-    (verified: layering '+base' leaked an extra key definition).
-
-    Structural rules carried over from the session-breaking bug: our rules come
-    BEFORE '! include %S/evdev' (first-match precedence), the include is '%S/evdev'
-    not '%S/rules/evdev' (doubled path returns no components and breaks ALL
-    keymaps), and each variant maps to BOTH types and symbols.
+    Structure carried over from the session-breaking bug: the include is
+    '%S/evdev' not '%S/rules/evdev' (the doubled path returns no components and
+    breaks ALL keymaps).
     """
 
+    _ = records  # symbols + standard types both resolve via the system wildcard
     ns = _NAMESPACE
     lines = ['// %s rules overlay' % ns, '']
-
-    def _base(record):
-        return record.get('base_layout') or 'us'
-
-    lines.append('! model\tlayout\tvariant\t=\ttypes')
-    for record in sorted(records, key=lambda r: r['identifier']):
-        for variant_name, _text in record['variants']:
-            lines.append('  *\t%s\t%s\t=\tcomplete+%s(%s)'
-                         % (_base(record), variant_name, ns, variant_name))
-    lines.append('')
-
-    lines.append('! model\tlayout\tvariant\t=\tsymbols')
-    for record in sorted(records, key=lambda r: r['identifier']):
-        for variant_name, _text in record['variants']:
-            lines.append('  *\t%s\t%s\t=\tpc+%s(%s)'
-                         % (_base(record), variant_name, ns, variant_name))
-    lines.append('')
-
-    # System rules LAST so our specific mappings take precedence (first match).
     lines.append('! include %S/evdev')
     lines.append('')
     return '\n'.join(lines)
@@ -193,7 +206,7 @@ def build_registry_xml(records):
     are augmenting it, not redefining it.
     """
 
-    # Group records by their base layout.
+    # Group records by their base layout, registered as '<base>-k2x'.
     by_base = {}
     for record in records:
         base = record.get('base_layout') or 'us'
@@ -203,8 +216,9 @@ def build_registry_xml(records):
            '<!DOCTYPE xkbConfigRegistry SYSTEM "xkb.dtd">',
            '<xkbConfigRegistry version="1.1">', '  <layoutList>']
     for base in sorted(by_base):
+        layout_name = k2x_base_name(base)
         out += ['    <layout>', '      <configItem>',
-                '        <name>%s</name>' % _xml_escape(base),
+                '        <name>%s</name>' % _xml_escape(layout_name),
                 '      </configItem>', '      <variantList>']
         for record in sorted(by_base[base], key=lambda r: r['identifier']):
             for variant_name, _text in record['variants']:
@@ -228,13 +242,15 @@ def build_registry_xml(records):
                         item.append('              <iso3166Id>%s</iso3166Id>'
                                     % _xml_escape(country))
                     item.append('            </countryList>')
-                iso_languages = record.get('iso_languages') or []
-                if iso_languages:
-                    item.append('            <languageList>')
-                    for language in iso_languages:
-                        item.append('              <iso639Id>%s</iso639Id>'
-                                    % _xml_escape(language))
-                    item.append('            </languageList>')
+                # NOTE: languageList is intentionally NOT emitted. When present,
+                # KDE MERGES our <base>-k2x entry into the system layout group for
+                # that language (e.g. Polish) and then derives the base symbols
+                # file from the group -- looking for our variant section inside
+                # 'symbols/pl' (which fails: "No Symbols named mac-k2x-ansi in
+                # include file pl") and, worse, leaving the layout unselectable.
+                # Without languageList, KDE treats <base>-k2x as its own group and
+                # resolves the section from 'symbols/<base>-k2x' where it actually
+                # lives. The flag is kept via countryList above.
                 item += ['          </configItem>', '        </variant>']
                 out += item
         out += ['      </variantList>', '    </layout>']
@@ -278,10 +294,28 @@ def _rebuild_managed_files(paths, manifest, force):
     merged = list(manifest['installed'].values())
     status = {}
 
+    # All per-base symbols files that currently exist on disk (so we can remove
+    # any that a new install no longer needs). They are the '<base>-k2x' files in
+    # symbols/, identified by the managed-region marker inside them. We match on
+    # the _BEGIN marker (content), NOT a filename suffix: the base tag is a single
+    # 'x' now, too generic to filter filenames by, and the marker is authoritative.
+    def _existing_k2x_symbols():
+        found = []
+        if os.path.isdir(paths.symbols_dir):
+            for name in os.listdir(paths.symbols_dir):
+                full = os.path.join(paths.symbols_dir, name)
+                if not os.path.isfile(full):
+                    continue
+                text = _read(full)
+                if text and _BEGIN in text:
+                    found.append(full)
+        return found
+
     if not merged:
-        # Nothing installed: remove the managed files entirely (clean slate).
-        for path in (paths.symbols_file, paths.types_file, paths.rules_file,
-                     paths.registry_file, paths.compose_file):
+        # Nothing installed: remove every managed file (clean slate).
+        stale = [paths.types_file, paths.rules_file, paths.registry_file,
+                 paths.compose_file] + _existing_k2x_symbols()
+        for path in stale:
             if os.path.exists(path):
                 os.remove(path)
                 status[os.path.basename(path)] = 'removed'
@@ -290,10 +324,22 @@ def _rebuild_managed_files(paths, manifest, force):
             json.dumps(manifest, indent=2, ensure_ascii=False), force)
         return status, merged
 
+    # Write one symbols file per base layout; track which we wrote so we can
+    # remove any leftover '<base>-k2x' file from a previous install.
+    symbols_by_base = build_symbols_files(merged)
+    written_symbol_paths = set()
+    for base, content in symbols_by_base.items():
+        path = paths.symbols_file_for(base)
+        written_symbol_paths.add(path)
+        status['symbols:%s' % k2x_base_name(base)] = _write_if_changed(
+            path, content, force)
+    for path in _existing_k2x_symbols():
+        if path not in written_symbol_paths:
+            os.remove(path)
+            status['symbols:%s' % os.path.basename(path)] = 'removed'
+
     status['types'] = _write_if_changed(
         paths.types_file, build_types_file(merged), force)
-    status['symbols'] = _write_if_changed(
-        paths.symbols_file, build_symbols_file(merged), force)
     status['rules'] = _write_if_changed(
         paths.rules_file, build_rules_file(merged), force)
     status['registry'] = _write_if_changed(
@@ -373,9 +419,9 @@ def validate_installed(records, paths=None):
     paths = paths or InstallPaths()
     failures = []
     for record in records:
-        base = record.get('base_layout') or 'us'
+        base = k2x_base_name(record.get('base_layout') or 'us')
         for variant_name, _text in record['variants']:
-            # Compile the way it is actually selected: <base>(mac-k2x-variant).
+            # Compile the way it is actually selected: <base>-k2x(mac-k2x-variant).
             ok, message = validate_keymap(base, variant_name, paths)
             if not ok:
                 failures.append((record['identifier'], variant_name, message))
@@ -384,10 +430,22 @@ def validate_installed(records, paths=None):
 
 def _snapshot_files(paths):
     """Capture current contents of every managed file (or None if absent), so a
-    failed install can be rolled back to the exact prior state."""
+    failed install can be rolled back to the exact prior state.
 
-    files = (paths.types_file, paths.symbols_file, paths.rules_file,
-             paths.registry_file, paths.compose_file, paths.manifest_file)
+    Includes every per-base '<base>-k2x' symbols file currently on disk, so
+    rollback restores or removes them exactly.
+    """
+
+    files = [paths.types_file, paths.rules_file, paths.registry_file,
+             paths.compose_file, paths.manifest_file]
+    if os.path.isdir(paths.symbols_dir):
+        for name in os.listdir(paths.symbols_dir):
+            full = os.path.join(paths.symbols_dir, name)
+            if not os.path.isfile(full):
+                continue
+            text = _read(full)
+            if text and _BEGIN in text:
+                files.append(full)
     return {path: _read(path) for path in files}
 
 
@@ -491,8 +549,18 @@ def uninstall_all(paths=None):
 
     paths = paths or InstallPaths()
     removed = []
-    for path in (paths.symbols_file, paths.types_file, paths.rules_file,
-                 paths.registry_file, paths.compose_file, paths.manifest_file):
+    targets = [paths.types_file, paths.rules_file, paths.registry_file,
+               paths.compose_file, paths.manifest_file]
+    # Every per-base symbols file we manage, matched by our managed-region marker.
+    if os.path.isdir(paths.symbols_dir):
+        for name in os.listdir(paths.symbols_dir):
+            full = os.path.join(paths.symbols_dir, name)
+            if not os.path.isfile(full):
+                continue
+            text = _read(full)
+            if text and _BEGIN in text:
+                targets.append(full)
+    for path in targets:
         if os.path.exists(path):
             try:
                 os.remove(path)

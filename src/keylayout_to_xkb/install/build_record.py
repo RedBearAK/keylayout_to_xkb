@@ -118,7 +118,7 @@ def build_record(layout: Layout) -> LayoutRecord:
         layout.provenance.source_id if layout.provenance else '',
     )
 
-    variants = emit_symbols_variants(layout, 'mac', display_stem)
+    variants = emit_symbols_variants(layout, 'mac-k2x', display_stem)
 
     note = ''
     if layout.provenance is not None and layout.provenance.source_id:
@@ -127,8 +127,12 @@ def build_record(layout: Layout) -> LayoutRecord:
 
     key_count, dead_key_count = _counts(layout)
     source_id = ''
-    if layout.provenance is not None and layout.provenance.source_id:
-        source_id = layout.provenance.source_id
+    source_languages = []
+    if layout.provenance is not None:
+        if layout.provenance.source_id:
+            source_id = layout.provenance.source_id
+        if getattr(layout.provenance, 'source_languages', None):
+            source_languages = list(layout.provenance.source_languages)
 
     return LayoutRecord(
         identifier=identifier,
@@ -140,6 +144,7 @@ def build_record(layout: Layout) -> LayoutRecord:
         compose_complete=_compose_is_complete(layout),
         dead_key_count=dead_key_count,
         key_count=key_count,
+        source_languages=source_languages,
     )
 
 

@@ -58,21 +58,27 @@ from keylayout_to_xkb.emit.classify import (
 )
 
 
-__version__ = '20260629'
+__version__ = '20260701c'
 
 
 # Planes in canonical level order, each with the XKB modifier-combination tokens
-# that select it. MacCaps is the custom Mod3 modifier; LevelThree is the standard
-# level-3 selector (RightAlt). An empty tuple is the no-modifier base level.
+# that select it. These map EXACTLY onto the standard EIGHT_LEVEL key type:
+# LevelThree (RightAlt) selects the Option layer, LevelFive (bound to CapsLock as
+# a lock) selects the caps layer. Using the STANDARD selectors -- not a custom
+# MacCaps modifier -- means keys reference the standard EIGHT_LEVEL/FOUR_LEVEL/etc
+# types that ship in every system's 'complete' types component. That matters
+# because desktop environments (KDE) load the standard types automatically but do
+# NOT reliably load a layout's own custom types file, which left every key stuck
+# on level 1 (Shift/AltGr/CapsLock dead). An empty tuple is the base level.
 _PLANE_LEVEL_ORDER = (
     (ModifierState.PLAIN,             ()),
     (ModifierState.SHIFT,             ('Shift',)),
     (ModifierState.OPTION,            ('LevelThree',)),
     (ModifierState.SHIFT_OPTION,      ('Shift', 'LevelThree')),
-    (ModifierState.CAPS,              ('MacCaps',)),
-    (ModifierState.CAPS_SHIFT,        ('MacCaps', 'Shift')),
-    (ModifierState.CAPS_OPTION,       ('MacCaps', 'LevelThree')),
-    (ModifierState.CAPS_SHIFT_OPTION, ('MacCaps', 'Shift', 'LevelThree')),
+    (ModifierState.CAPS,              ('LevelFive',)),
+    (ModifierState.CAPS_SHIFT,        ('Shift', 'LevelFive')),
+    (ModifierState.CAPS_OPTION,       ('LevelThree', 'LevelFive')),
+    (ModifierState.CAPS_SHIFT_OPTION, ('Shift', 'LevelThree', 'LevelFive')),
 )
 
 _PLANE_INDEX = {plane: i for i, (plane, _mods) in enumerate(_PLANE_LEVEL_ORDER)}
@@ -129,173 +135,112 @@ def _cell_token(layout: Layout, virtual_key: int, plane: ModifierState,
     return None
 
 
-def _key_present_planes(layout: Layout, virtual_key: int) -> 'list[ModifierState]':
-    """The planes this key actually produces output on, in canonical order.
+# Standard XKB key types by max level. These ship in every system's 'complete'
+# types component, so KDE loads them automatically -- unlike a layout's own custom
+# types, which KDE does not reliably load. The plane->level order above matches
+# these types exactly: Shift=L2, LevelThree=L3/L4, LevelFive=L5..L8.
+#
+# We use the PLAIN types, NOT the _ALPHABETIC variants. CapsLock feeds LevelFive
+# (via ISO_Level5_Lock on <CAPS>), not the standard Lock modifier, so the
+# alphabetic types' Lock handling never applies -- and worse, it would be WRONG:
+# EIGHT_LEVEL_ALPHABETIC maps Shift+Lock+LevelThree back down to Level3 (Shift
+# "reverses" caps), which scrambles the Mac caps+Option layers (L7/L8). Plain
+# EIGHT_LEVEL selects L5..L8 cleanly from LevelFive, giving correct caps, caps+opt
+# and caps+shift+opt output for every key, letters and punctuation alike.
+_STANDARD_TYPE = {
+    1: 'ONE_LEVEL',
+    2: 'TWO_LEVEL',
+    4: 'FOUR_LEVEL',
+    8: 'EIGHT_LEVEL',
+}
 
-    A plane counts as present when the key has a DEAD cell or a non-empty CHARS
-    cell there. Planes the key lacks are simply absent (the key has no level for
-    that modifier combination), which is faithful to the source.
+
+def _standard_type_for(max_level: int) -> str:
+    """Pick the smallest standard type whose level count covers max_level.
+
+    Standard types come in 1/2/4/8 levels; a key that reaches level 5-8 needs the
+    8-level type (with NoSymbol padding for any absent middle levels), a key
+    reaching level 3-4 needs the 4-level type, and so on.
     """
 
-    modmap = layout.keys.get(virtual_key, {})
-    present = []
+    if max_level <= 1:
+        return _STANDARD_TYPE[1]
+    if max_level <= 2:
+        return _STANDARD_TYPE[2]
+    if max_level <= 4:
+        return _STANDARD_TYPE[4]
+    return _STANDARD_TYPE[8]
+
+
+def _padded_tokens(layout: Layout, virtual_key: int, placeholders: 'dict') -> 'tuple':
+    """Build a key's level tokens padded to a contiguous 1..max_level list.
+
+    The plane->level order is fixed (plain=1, shift=2, option=3, shift+option=4,
+    caps=5..caps+shift+option=8). A key may lack some planes; standard XKB types
+    require contiguous levels, so absent levels below the highest present one are
+    filled with NoSymbol. Returns (tokens_list, max_level).
+    """
+
+    # Map each present plane to its fixed level index (1-based) and token.
+    level_token = {}
     for plane, _mods in _PLANE_LEVEL_ORDER:
-        key_output = modmap.get(plane)
-        if key_output is None:
-            continue
-        if key_output.kind is OutputKind.DEAD:
-            present.append(plane)
-        elif key_output.kind is OutputKind.CHARS and key_output.output:
-            present.append(plane)
-    return present
-
-
-def _key_signature(layout: Layout, plane_tables: 'dict', virtual_key: int) -> 'tuple':
-    """A key's intrinsic modifier behavior, as a hashable signature.
-
-    Two keys share a signature (and therefore a type) when they have output on
-    the same planes AND those planes route to the same relative table structure.
-    The signature is the tuple of (plane_index, table_index) for present planes;
-    table_index comes from plane_tables so planes that collapse to a shared table
-    (e.g. Caps+Shift == Shift on a Latin layout) group consistently. A None
-    table_index is kept as-is, so such keys only group with others also lacking
-    it on that plane.
-    """
-
-    signature = []
-    for plane in _key_present_planes(layout, virtual_key):
-        signature.append((_PLANE_INDEX[plane], plane_tables.get(plane)))
-    return tuple(signature)
-
-
-def _type_name(stem: str, ordinal: int) -> str:
-    """Generated type name, unique within the emitted file."""
-
-    return 'MAC_%s_%d' % (stem.upper(), ordinal)
-
-
-def _build_type_levels(present_planes: 'list[ModifierState]') -> 'list[tuple]':
-    """Assign present planes to consecutive level indices (1-based).
-
-    Returns a list of (level_index, plane, modifier_tokens). Planes keep their
-    canonical order; level indices are consecutive from 1 with no gaps (XKB
-    levels must be contiguous). The modifier tokens are what the type's map[]
-    line lists to select that level.
-    """
-
-    levels = []
-    modifier_lookup = dict(_PLANE_LEVEL_ORDER)
-    for index, plane in enumerate(present_planes, start=1):
-        levels.append((index, plane, modifier_lookup[plane]))
-    return levels
-
-
-def _render_type(type_name: str, levels: 'list[tuple]') -> str:
-    """Render one xkb_types entry for a key-group's level structure."""
-
-    used_modifiers = []
-    for _index, _plane, mod_tokens in levels:
-        for token in mod_tokens:
-            if token not in used_modifiers:
-                used_modifiers.append(token)
-
-    lines = []
-    lines.append('    type "%s" {' % type_name)
-    if used_modifiers:
-        lines.append('        modifiers = %s;' % '+'.join(used_modifiers))
-    else:
-        lines.append('        modifiers = None;')
-
-    for index, _plane, mod_tokens in levels:
-        combo = '+'.join(mod_tokens) if mod_tokens else 'None'
-        lines.append('        map[%s] = Level%d;' % (combo, index))
-
-    for index, plane, _mod_tokens in levels:
-        lines.append('        level_name[Level%d] = "%s";' % (index, plane.value))
-
-    lines.append('    };')
-    return '\n'.join(lines)
-
-
-def _level_tokens(layout: Layout, virtual_key: int,
-                  present_planes: 'list[ModifierState]',
-                  placeholders: 'dict') -> 'list[str]':
-    """The keysym tokens for a key, one per present plane (in level order).
-
-    Multi-char cells resolve to their PUA placeholder keysym (expanded by an
-    XCompose rule). A cell that genuinely yields no token (e.g. a multi-char
-    string with no allocated placeholder, which should not happen) becomes
-    NoSymbol so the level position is preserved.
-    """
-
-    tokens = []
-    for plane in present_planes:
         token = _cell_token(layout, virtual_key, plane, placeholders)
-        tokens.append(token if token is not None else 'NoSymbol')
-    return tokens
+        if token is not None:
+            level_token[_PLANE_INDEX[plane] + 1] = token
+
+    if not level_token:
+        return [], 0
+    max_level = max(level_token)
+    tokens = [level_token.get(lvl, 'NoSymbol') for lvl in range(1, max_level + 1)]
+    return tokens, max_level
 
 
 def _build_key_groups(layout: Layout, plane_tables: 'dict') -> 'tuple':
-    """Group keys by signature and build the per-group types and key rows.
+    """Build the per-key standard-type assignment and padded symbol rows.
 
     Returns (types, key_rows):
-      types    -- list of (type_name, type_text) in stable order
-      key_rows -- dict xkb_code -> (type_name, tokens_csv)
-    Keys with no present planes (nothing to type) are omitted entirely.
+      types    -- always empty now (we reference standard system types, so the
+                  emitter defines none of its own); kept for signature stability.
+      key_rows -- dict xkb_code -> (standard_type_name, tokens_csv)
+    Keys with no output on any plane are omitted entirely.
     """
 
     placeholders = reserve_placeholders(layout)
 
-    signature_keys = {}
-    signature_planes = {}
+    key_rows = {}
     for virtual_key, xkb_code in _VK_TO_XKB.items():
         if virtual_key not in layout.keys:
             continue
-        present = _key_present_planes(layout, virtual_key)
-        if not present:
+        tokens, max_level = _padded_tokens(layout, virtual_key, placeholders)
+        if not tokens:
             continue
-        signature = _key_signature(layout, plane_tables, virtual_key)
-        signature_keys.setdefault(signature, []).append((virtual_key, xkb_code))
-        signature_planes[signature] = present
+        type_name = _standard_type_for(max_level)
+        key_rows[xkb_code] = (type_name, ', '.join(tokens))
 
-    ordered_signatures = sorted(
-        signature_keys,
-        key=lambda sig: (-len(signature_keys[sig]), sig),
-    )
-
-    types = []
-    key_rows = {}
-    for ordinal, signature in enumerate(ordered_signatures, start=1):
-        present = signature_planes[signature]
-        levels = _build_type_levels(present)
-        type_name = _type_name('KEY', ordinal)
-        types.append((type_name, _render_type(type_name, levels)))
-        for virtual_key, xkb_code in signature_keys[signature]:
-            tokens = _level_tokens(layout, virtual_key, present, placeholders)
-            key_rows[xkb_code] = (type_name, ', '.join(tokens))
-
-    return types, key_rows
+    return [], key_rows
 
 
 def _render_layout(types: 'list', key_rows: 'dict',
                    variant_name: str, display_name: str) -> str:
-    """Render a full xkb_symbols block with its accompanying xkb_types."""
+    """Render the xkb_symbols block.
+
+    No custom xkb_types are emitted: every key references a STANDARD system type
+    (ONE/TWO/FOUR/EIGHT_LEVEL), which the 'complete' types component always
+    provides. This is what makes the layout work in desktop environments like KDE,
+    which load the standard types automatically but do not reliably load a layout's
+    own custom types file.
+
+    Two standard includes wire up the modifier layers:
+      * level3(ralt_switch): RightAlt -> LevelThree (the Option/AltGr layer, L3/L4)
+      * <CAPS> -> ISO_Level5_Lock:  CapsLock LOCKS LevelFive, selecting the Mac
+        caps layer (L5..L8) cleanly. Combined with plain (non-alphabetic) types
+        this reproduces the full Mac model: caps uppercases letters (L5), and
+        caps+Option / caps+Shift+Option reach the distinct L7/L8 glyphs (e.g.
+        Ś, £ on the Polish 'r' key) instead of collapsing back down as the
+        _ALPHABETIC types do.
+    """
 
     lines = []
-
-    lines.append('xkb_types "%s" {' % variant_name)
-    lines.append('')
-    # LevelThree is the standard virtual modifier for the Option/AltGr layer
-    # (mapped to RightAlt by the level3 include); MacCaps is our custom caps-layer
-    # modifier on Mod3. Both must be declared before the types reference them.
-    lines.append('    virtual_modifiers LevelThree, MacCaps;')
-    lines.append('')
-    for _name, text in types:
-        lines.append(text)
-        lines.append('')
-    lines.append('};')
-    lines.append('')
-
     lines.append('xkb_symbols "%s" {' % variant_name)
     lines.append('')
     lines.append('    name[Group1] = "%s";' % display_name)
@@ -311,12 +256,13 @@ def _render_layout(types: 'list', key_rows: 'dict',
         )
 
     lines.append('')
+    # CapsLock LOCKS LevelFive, selecting the Mac caps layer (L5..L8). Plain
+    # EIGHT_LEVEL types map LevelFive cleanly to L5..L8, so caps+Option reaches
+    # L7 and caps+Shift+Option reaches L8 (no shift-reverses-caps collapse).
     lines.append('    key <CAPS> {')
     lines.append('        type[Group1] = "ONE_LEVEL",')
-    lines.append('        symbols[Group1] = [ Caps_Lock ],')
-    lines.append('        actions[Group1] = [ LockMods(modifiers = MacCaps) ]')
+    lines.append('        symbols[Group1] = [ ISO_Level5_Lock ]')
     lines.append('    };')
-    lines.append('    modifier_map Mod3 { <CAPS> };')
     lines.append('')
     lines.append('    include "level3(ralt_switch)"')
     lines.append('};')

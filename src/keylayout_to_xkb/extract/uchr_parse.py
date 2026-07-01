@@ -225,8 +225,14 @@ def _build_variant_keys(
     return keys, plane_tables
 
 
-def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '') -> Layout:
-    """Parse a single 'uchr' byte buffer into a normalized Layout."""
+def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '',
+               languages: 'list | None' = None) -> Layout:
+    """Parse a single 'uchr' byte buffer into a normalized Layout.
+
+    languages, when provided, is Apple's authoritative ISO 639 language list for
+    this layout (from the TIS API via tis_source); it is stored in provenance
+    for the emitter/registry to group and flag the layout accurately.
+    """
 
     if len(data) < 40:
         raise UchrParseError(f'buffer too small to be uchr: {len(data)} bytes')
@@ -342,6 +348,14 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '') -> Layou
     )
 
     layout = Layout(name=layout_name, source_id=source_id or None)
+    # Mirror source_id into provenance too: _identifier_from() reads
+    # provenance.source_id to derive the layout token (PolishPro -> polishpro).
+    # Without this, the live TIS path (which passes the localized name 'Polish'
+    # as layout_name) falls back to that name and yields 'polish' instead.
+    if source_id:
+        layout.provenance.source_id = source_id
+    if languages:
+        layout.provenance.source_languages = list(languages)
 
     terminators = _parse_terminators(
         data, state_terminators_offset, sequences

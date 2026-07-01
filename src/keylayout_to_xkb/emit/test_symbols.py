@@ -68,6 +68,21 @@ def test_all_keysyms_valid() -> bool:
     return not bad
 
 
+def _key_symbols(text: str, xkb_code: str) -> 'list | None':
+    """Extract the symbols list for a key from the new multi-line format.
+
+    Matches:  key <CODE> { type[Group1] = "...", symbols[Group1] = [ a, A, ... ] };
+    Returns the level token list, or None if the key is not present.
+    """
+
+    pattern = (r'key <%s>\s*\{[^}]*?symbols\[Group1\]\s*=\s*\[([^\]]+)\]'
+               % re.escape(xkb_code))
+    match = re.search(pattern, text)
+    if not match:
+        return None
+    return [token.strip() for token in match.group(1).split(',')]
+
+
 def test_polish_letters_positioned() -> bool:
     """The Polish letters land on the expected keys at the option level."""
 
@@ -75,7 +90,7 @@ def test_polish_letters_positioned() -> bool:
         print('  skipped (fixture missing)')
         return True
     text = _polish_pro_symbols()
-    # (xkb_key, expected option-level keysym)
+    # (xkb_key, expected option-level keysym = level 3, index 2)
     expect = {
         'AC01': 'aogonek', 'AB03': 'cacute', 'AD03': 'eogonek',
         'AC09': 'lstroke', 'AB06': 'nacute', 'AD09': 'oacute',
@@ -83,12 +98,11 @@ def test_polish_letters_positioned() -> bool:
     }
     ok = True
     for key, want in expect.items():
-        m = re.search(r'<%s>\s*\{\[([^\]]+)\]\}' % key, text)
-        if not m:
+        levels = _key_symbols(text, key)
+        if levels is None:
             ok = False
             print(f'  {key}: not emitted')
             continue
-        levels = [t.strip() for t in m.group(1).split(',')]
         got = levels[2] if len(levels) > 2 else '(none)'
         if got != want:
             ok = False
@@ -104,11 +118,13 @@ def test_dead_keys_placed() -> bool:
         print('  skipped (fixture missing)')
         return True
     text = _polish_pro_symbols()
+    # dead keys sit at the option level (index 2) of their keys.
     checks = [('AD07', 'dead_diaeresis'), ('AD08', 'dead_circumflex'),
               ('TLDE', 'dead_grave')]
     ok = True
     for key, want in checks:
-        if not re.search(r'<%s>[^\n]*%s' % (key, want), text):
+        levels = _key_symbols(text, key)
+        if levels is None or want not in levels:
             ok = False
             print(f'  {key}: expected {want} not found')
     print(f'  dead-key placement: {"ok" if ok else "MISMATCH"}')
@@ -116,18 +132,25 @@ def test_dead_keys_placed() -> bool:
 
 
 def test_structure() -> bool:
-    """Header, name, level3 include, and four-level rows are present."""
+    """Header, name, standard types, level3 + Level5-lock, and a full key row."""
 
     if not os.path.isfile(_FIXTURE):
         print('  skipped (fixture missing)')
         return True
     text = _polish_pro_symbols()
     ok = ('xkb_symbols "pl_mac"' in text
-          and 'name[Group1]= "Polish (Macintosh)"' in text
+          # No custom xkb_types block or MacCaps: keys use standard system types
+          # so KDE loads them automatically.
+          and 'xkb_types' not in text
+          and 'MacCaps' not in text
+          and 'name[Group1] = "Polish (Macintosh)"' in text
           and 'include "level3(ralt_switch)"' in text
+          and 'EIGHT_LEVEL' in text
+          and 'ISO_Level5_Lock' in text
           and text.rstrip().endswith('};'))
-    # At least one full four-level key row.
-    ok = ok and bool(re.search(r'<AC01>\s*\{\[ a, A, aogonek, Aogonek \]\}', text))
+    # AC01 should carry a, A, aogonek, Aogonek on the first four levels.
+    levels = _key_symbols(text, 'AC01')
+    ok = ok and levels is not None and levels[:4] == ['a', 'A', 'aogonek', 'Aogonek']
     print(f'  structure: {"ok" if ok else "MALFORMED"}')
     return ok
 
@@ -151,18 +174,13 @@ def test_iso_ansi_variants_and_swap() -> bool:
         print(f'  unexpected variant names: {names}')
         return False
 
-    def tlde_lsgt(text):
-        t = re.search(r'<TLDE>\s*\{\[ ([^\]]+) \]\}', text)
-        l = re.search(r'<LSGT>\s*\{\[ ([^\]]+) \]\}', text)
-        return (t.group(1) if t else None, l.group(1) if l else None)
-
-    a_tl, a_ls = tlde_lsgt(variants[0][1])
-    i_tl, i_ls = tlde_lsgt(variants[1][1])
+    a_tl = _key_symbols(variants[0][1], 'TLDE')
+    a_ls = _key_symbols(variants[0][1], 'LSGT')
+    i_tl = _key_symbols(variants[1][1], 'TLDE')
+    i_ls = _key_symbols(variants[1][1], 'LSGT')
     swapped = (a_tl == i_ls and a_ls == i_tl and a_tl is not None)
-    # Everything else identical: the AC01 row must match across variants.
-    a_ac01 = re.search(r'<AC01>[^\n]+', variants[0][1]).group(0)
-    i_ac01 = re.search(r'<AC01>[^\n]+', variants[1][1]).group(0)
-    others_same = a_ac01 == i_ac01
+    # Everything else identical: the AC01 symbols must match across variants.
+    others_same = _key_symbols(variants[0][1], 'AC01') == _key_symbols(variants[1][1], 'AC01')
     print(f'  variants={names} tlde/lsgt swapped={swapped} other-keys-identical={others_same}')
     return swapped and others_same
 
