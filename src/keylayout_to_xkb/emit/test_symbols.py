@@ -146,7 +146,18 @@ def test_structure() -> bool:
           and 'name[Group1] = "Polish (Macintosh)"' in text
           and 'include "level3(ralt_switch)"' in text
           and 'EIGHT_LEVEL' in text
-          and 'ISO_Level5_Lock' in text
+          # The <CAPS> Level5 lock persists only with a real modifier backing,
+          # and the LevelFive->Mod3 binding must live on the PHANTOM <LVL5>
+          # key: binding through <CAPS> picks up Lock from sibling layouts'
+          # Caps_Lock keysym in multi-layout keymaps (modifier_map Lock is
+          # keysym-based in symbols/pc), leaking caps state across layouts.
+          and 'key <LVL5> {' in text
+          and 'vmods = LevelFive,' in text
+          and 'actions[Group1] = [ SetMods(modifiers=LevelFive) ]' in text
+          and 'modifier_map Mod3 { <LVL5> };' in text
+          and 'symbols[Group1] = [ ISO_Level5_Lock ],' in text
+          and 'actions[Group1] = [ LockMods(modifiers=LevelFive) ]' in text
+          and 'modifier_map Mod3 { <CAPS> };' not in text
           and text.rstrip().endswith('};'))
     # AC01 should carry a, A, aogonek, Aogonek on the first four levels.
     levels = _key_symbols(text, 'AC01')
