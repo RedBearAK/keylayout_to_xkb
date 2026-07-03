@@ -21,10 +21,11 @@ sees what it does before the embedded data, and only the final line executes.
 
 import json
 
+from keylayout_to_xkb.common.debug import warn
 from keylayout_to_xkb.install.catalog import LayoutRecord
 
 
-__version__ = '20260623'
+__version__ = '20260703'
 
 
 def _record_to_dict(record: LayoutRecord) -> 'dict':
@@ -44,6 +45,7 @@ def _record_to_dict(record: LayoutRecord) -> 'dict':
     from keylayout_to_xkb.install.catalog import language_iso_codes
     from keylayout_to_xkb.install.language_data import (
         tis_languages_for, country_for_language, base_layout_for_language,
+        base_layout_is_known,
     )
 
     languages = []
@@ -95,6 +97,14 @@ def _record_to_dict(record: LayoutRecord) -> 'dict':
     # variant of that base. 'us' fallback when the language has no system base.
     base_key = short_desc or (iso_languages[0] if iso_languages else 'en')
     base_layout = base_layout_for_language(base_key)
+    if not base_layout_is_known(base_key):
+        # Neither mapped nor in the verified-baseless set: a language nobody
+        # has classified yet (e.g. a layout Apple added after the last
+        # registry cross-reference). Grouping under 'us' silently is how the
+        # Inuktitut family hid there for weeks -- so be loud about it.
+        warn('base', f'{record.display_name!r}: language {base_key!r} is '
+             'unclassified (not in the base map nor the known-baseless set); '
+             'grouping under us. Classify it in language_data.py.')
 
     return {
         'identifier': record.identifier,
@@ -719,11 +729,16 @@ def _embedded_core_source() -> str:
 
 def _module_versions():
     """Collect the __version__ dates of the modules whose code shapes an
-    installer, as a readable composite like 'rc20260701/gen20260623/br20260623'.
+    installer, as a readable composite like
+    'rc20260701/gen20260702/br20260623/up20260702/uckt20260702'.
 
     Read defensively: a module missing __version__ contributes '00000000' so the
     composite is always well-formed. runtime_core (rc) leads because it is the
-    embedded engine that most determines installer behavior.
+    embedded engine that most determines installer behavior. The EXTRACTION
+    modules (up = uchr_parse, uckt = uckeytranslate) are stamped too: the
+    records baked into an installer are only as good as the parse that built
+    them, and an earlier stamp that omitted extraction hid a four-plane
+    uckeytranslate behind an apparently current rc/gen/br composite.
     """
 
     import os as _os
@@ -735,8 +750,10 @@ def _module_versions():
         match = _re.search(r"__version__\s*=\s*'(\d{8})'", text or '')
         return match.group(1) if match else '00000000'
 
-    return 'rc%s/gen%s/br%s' % (
-        _ver('runtime_core.py'), _ver('generate.py'), _ver('build_record.py'))
+    return 'rc%s/gen%s/br%s/up%s/uckt%s' % (
+        _ver('runtime_core.py'), _ver('generate.py'), _ver('build_record.py'),
+        _ver(_os.path.join('..', 'extract', 'uchr_parse.py')),
+        _ver(_os.path.join('..', 'extract', 'uckeytranslate.py')))
 
 
 def _read_text(path):

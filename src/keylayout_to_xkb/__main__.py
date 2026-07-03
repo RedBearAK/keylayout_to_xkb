@@ -36,11 +36,12 @@ import sys
 import argparse
 
 from keylayout_to_xkb.common.debug import set_debug, dbg, warn
+from keylayout_to_xkb.install.catalog import fold_name_to_ascii
 from keylayout_to_xkb.extract.tis_source import extract_all_layouts, TISExtractionError
 from keylayout_to_xkb.extract.uchr_parse import parse_uchr, UchrParseError
 
 
-__version__ = '20260629'
+__version__ = '20260703'
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -138,6 +139,13 @@ def _summarize(layout, raw_len: int) -> None:
         print(f'  source_id:      {layout.source_id}')
     print(f'  raw bytes:      {raw_len}')
     print(f'  virtual keys:   {len(layout.keys)}')
+    # Distinct planes across all keys: a healthy Latin layout shows 8. This
+    # line exists because a four-plane generation once looked identical to an
+    # eight-plane one in this summary while the caps layers were missing.
+    plane_count = len({
+        plane for outputs in layout.keys.values() for plane in outputs
+    })
+    print(f'  planes:         {plane_count}')
     print(f'  dead states:    {layout.dead_key_count()}')
     print(f'  approx chars:   {layout.char_count()}')
 
@@ -469,7 +477,10 @@ def main(argv: 'list[str] | None' = None) -> int:
     built_pairs = []                                    # (record, layout) pairs
 
     for payload in payloads:
-        name = payload.get('name') or ''
+        # Fold to pure ASCII at the single entry point: everything downstream
+        # (summaries, records, name[Group1], the registry) inherits it, so an
+        # en dash in a TIS name can never again reach an ASCII-locale consumer.
+        name = fold_name_to_ascii(payload.get('name') or '')
         source_id = payload.get('source_id') or ''
         data = payload.get('data')
         languages = payload.get('languages') or []
@@ -498,7 +509,10 @@ def main(argv: 'list[str] | None' = None) -> int:
 
         if args.make_installer is not None:
             from keylayout_to_xkb.install.build_record import build_record
+            from keylayout_to_xkb.install.generate import _record_to_dict
             record = build_record(layout)
+            print('  base layout:    %s'
+                  % _record_to_dict(record).get('base_layout', '?'))
             built_records.append(record)
             built_pairs.append((record, layout))
 

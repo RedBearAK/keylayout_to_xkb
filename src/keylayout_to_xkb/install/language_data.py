@@ -323,7 +323,49 @@ _LANGUAGE_TO_BASE_LAYOUT = {
     'ro': 'ro', 'ru': 'ru', 'sr': 'rs', 'sk': 'sk', 'sl': 'si', 'es': 'es',
     'sv': 'se', 'th': 'th', 'tr': 'tr', 'uk': 'ua', 'be': 'by', 'kk': 'kz',
     'mn': 'mn', 'fa': 'ir', 'ur': 'pk', 'ug': 'cn', 'tk': 'tm',
+    # Entries below were derived by cross-referencing every TIS primary
+    # language against xkeyboard-config 2.47's registry (evdev.xml), scanning
+    # languageList declarations at BOTH layout and variant level with all ISO
+    # 639-1/2B/2T/3 code forms. Multi-home languages picked the native or
+    # dominant-population base. Keys are BARE primary subtags (the resolver
+    # strips '-Latn'/'-Cyrl' script tags via _bare()).
+    'ak': 'gh', 'am': 'et', 'as': 'in', 'az': 'az', 'bo': 'cn', 'cv': 'ru',
+    'dv': 'mv', 'dz': 'bt', 'ff': 'gh', 'fo': 'fo', 'ga': 'ie', 'gu': 'in',
+    'ha': 'ng', 'ig': 'ng', 'iu': 'ca', 'km': 'kh', 'kn': 'in', 'ku': 'tr',
+    'ky': 'kg', 'lo': 'la', 'mi': 'nz', 'ml': 'in', 'mr': 'in', 'ms': 'my',
+    'mt': 'mt', 'my': 'mm', 'ne': 'np', 'or': 'in', 'pa': 'in', 'ps': 'af',
+    'sa': 'in', 'sd': 'pk', 'se': 'no', 'si': 'lk', 'sq': 'al', 'ta': 'in',
+    'te': 'in', 'tg': 'tj', 'uz': 'uz', 'vi': 'vn', 'yo': 'ng', 'zh': 'cn',
+    'brx': 'in', 'chr': 'us', 'doi': 'in', 'haw': 'us', 'kab': 'dz',
+    'kok': 'in', 'mai': 'in', 'mni': 'in', 'nqo': 'gn', 'sat': 'in',
+    'syr': 'sy',
 }
+
+
+# Languages verified (against the same registry scan) to have NO
+# xkeyboard-config home at any level: the 'us' fallback is the CORRECT and
+# deliberate result for these, so generation must not warn about them. If a
+# future xkeyboard-config release adds a home, the registry-consistency probe
+# (tests/probes/probe_base_map_vs_registry.py) flags the entry for promotion
+# into _LANGUAGE_TO_BASE_LAYOUT.
+_KNOWN_BASELESS_LANGUAGES = frozenset((
+    'af', 'apw', 'cho', 'cic', 'ckb', 'cy', 'hmn', 'inh', 'ks', 'mic',
+    'mid', 'nnp', 'nv', 'osa', 'pqm', 'rej', 'rhg', 'sjd', 'sje', 'sju',
+    'sm', 'sma', 'smj', 'smn', 'sms', 'to', 'yi', 'zgh',
+))
+
+
+def base_layout_is_known(iso639: str) -> bool:
+    """True when the language resolves deliberately: mapped, baseless, or en.
+
+    Generation warns loudly for any language outside all three cases -- a new
+    Apple layout whose language nobody has classified yet -- so a fallthrough
+    to 'us' can never again happen silently.
+    """
+
+    return (iso639 in _LANGUAGE_TO_BASE_LAYOUT
+            or iso639 in _KNOWN_BASELESS_LANGUAGES
+            or iso639 == 'en')
 
 
 def base_layout_for_language(iso639: str, symbols_dir=None) -> str:

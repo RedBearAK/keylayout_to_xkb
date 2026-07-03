@@ -24,6 +24,7 @@ from keylayout_to_xkb.common.models import (
     KeyOutput,
     OutputKind,
     ModifierState,
+    PLANE_MODIFIER_BYTE,
 )
 from keylayout_to_xkb.extract.uckeytranslate import resolve_plane_tables_via_os
 from keylayout_to_xkb.common.gestalt_keyboard import (
@@ -32,7 +33,7 @@ from keylayout_to_xkb.common.gestalt_keyboard import (
 )
 
 
-__version__ = '20260623'
+__version__ = '20260702b'
 
 
 _EXPECTED_HEADER_FORMAT     = 0x1002
@@ -316,9 +317,12 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '',
 
     # Prefer Apple's UCKeyTranslate for an authoritative plane->table map when
     # running on macOS; fall back to content-driven resolution everywhere else.
-    # The OS path resolves the same four planes deterministically, sidestepping
-    # the undocumented on-disk modifier-index encoding. Both paths feed the same
-    # downstream machinery (dead keys, terminators, compositions).
+    # Both resolvers cover all eight typeable planes via the SHARED
+    # PLANE_MODIFIER_BYTE constant and feed the same downstream machinery
+    # (dead keys, terminators, compositions). When the OS path resolves only
+    # SOME planes, the content resolver fills the rest LOUDLY: a silent
+    # partial resolution is exactly how the caps quartet vanished from every
+    # on-Mac generation while every off-Mac test stayed green.
     def table_outputs_for(table_index):
         return _table_outputs(
             data, char_tables[table_index], state_records, sequences,
@@ -330,11 +334,44 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '',
             data, char_tables, table_outputs_for
         )
     except Exception as os_error:                       # never let OS path abort
-        warn('uchr', f'UCKeyTranslate path errored ({os_error}); using content resolver')
+        warn('uchr', f'{layout_name!r}: UCKeyTranslate path errored '
+             f'({os_error}); using content resolver')
         plane_tables = None
 
     if plane_tables:
         dbg('uchr', 'plane resolution: UCKeyTranslate (deterministic)')
+        content_tables = _resolve_plane_tables(
+            data, char_tables, table_map, default_table,
+            state_records, sequences,
+        )
+        missing = [
+            plane for plane in content_tables if plane not in plane_tables
+        ]
+        if missing:
+            warn(
+                'uchr',
+                f'{layout_name!r}: UCKeyTranslate left plane(s) unresolved: '
+                + ', '.join(plane.value for plane in missing)
+                + '; filling from the content resolver'
+            )
+            for plane in missing:
+                plane_tables[plane] = content_tables[plane]
+        # Disagreements matter only when the two tables differ in CONTENT: with
+        # duplicate char tables the oracle's best-match may legitimately pick a
+        # different index than the on-disk map for the same outputs.
+        for plane, os_index in sorted(
+                plane_tables.items(), key=lambda kv: kv[0].value):
+            content_index = content_tables.get(plane)
+            if content_index is None or content_index == os_index:
+                continue
+            if table_outputs_for(content_index) != table_outputs_for(os_index):
+                warn(
+                    'uchr',
+                    f'{layout_name!r} plane {plane.value}: OS resolved table '
+                    f'{os_index} but '
+                    f'on-disk map says table {content_index} with different '
+                    f'content; keeping the OS result'
+                )
     else:
         plane_tables = _resolve_plane_tables(
             data, char_tables, table_map, default_table,
@@ -618,16 +655,12 @@ def _resolve_plane_tables(
             if 0 <= ti < table_count
         }
 
-    # plane -> (modifier byte + 2) index into keyModifiersToTableNum.
+    # plane -> (modifier byte + 2) index into keyModifiersToTableNum. The
+    # bytes come from the SHARED PLANE_MODIFIER_BYTE constant (models.py), the
+    # same one the UCKeyTranslate resolver and the verify audit use, so the
+    # on-disk and OS-oracle plane sets can never drift apart again.
     plane_index = {
-        ModifierState.PLAIN:             0x00 + 2,
-        ModifierState.SHIFT:             0x02 + 2,
-        ModifierState.OPTION:            0x08 + 2,
-        ModifierState.SHIFT_OPTION:      0x0A + 2,
-        ModifierState.CAPS:              0x04 + 2,
-        ModifierState.CAPS_SHIFT:        0x06 + 2,
-        ModifierState.CAPS_OPTION:       0x0C + 2,
-        ModifierState.CAPS_SHIFT_OPTION: 0x0E + 2,
+        plane: byte + 2 for plane, byte in PLANE_MODIFIER_BYTE.items()
     }
 
     resolved = {}
@@ -1153,14 +1186,15 @@ def _verify_plane_assignment(
         if comparable and differing == 0:
             warn(
                 'uchr',
-                'plane sanity: plain and shift planes are identical for all '
-                'sampled letter keys; modifier-plane resolution may be wrong'
+                f'{layout.name!r} plane sanity: plain and shift planes are '
+                'identical for all sampled letter keys; modifier-plane '
+                'resolution may be wrong'
             )
     elif plain_table is not None and shift_table is not None and plain_table == shift_table:
         warn(
             'uchr',
-            'plane sanity: plain and shift resolved to the same table; '
-            'modifier-plane resolution may be wrong'
+            f'{layout.name!r} plane sanity: plain and shift resolved to the '
+            'same table; modifier-plane resolution may be wrong'
         )
 
 

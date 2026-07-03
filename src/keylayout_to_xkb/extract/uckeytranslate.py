@@ -39,10 +39,13 @@ import ctypes
 from ctypes import util as ctypes_util
 
 from keylayout_to_xkb.common.debug import dbg, warn
-from keylayout_to_xkb.common.models import ModifierState
+from keylayout_to_xkb.common.models import (
+    ModifierState,
+    PLANE_MODIFIER_BYTE,
+)
 
 
-__version__ = '20260623'
+__version__ = '20260702'
 
 
 def _utf16_units_to_str(out_buffer, length: int) -> str:
@@ -70,16 +73,13 @@ _HITOOLBOX_PATH = (
 # kUCKeyActionDown
 _KEY_ACTION_DOWN = 0
 
-# The modifierKeyState byte for each plane is (carbonModifiers >> 8) & 0xFF.
-# shiftKey = 0x0200, optionKey = 0x0800 in the Carbon headers, so >>8 gives
-# 0x02 and 0x08. These are exactly the generic-bit states UCKeyTranslate is fed
-# in the wild (confirmed across Chromium/Microsoft/Opera); no sided bits.
-_PLANE_MODIFIER_BYTE = {
-    ModifierState.PLAIN:        0x00,
-    ModifierState.SHIFT:        0x02,
-    ModifierState.OPTION:       0x08,
-    ModifierState.SHIFT_OPTION: 0x0A,
-}
+# The plane -> modifierKeyState byte mapping is the SHARED constant
+# PLANE_MODIFIER_BYTE in common/models.py -- all eight typeable planes,
+# including the caps quartet. Deliberately NOT redeclared here: this module
+# once carried its own four-plane copy, which silently dropped the caps layers
+# from every on-Mac plane resolution after the content resolver grew to eight
+# planes (while every off-Mac test, taking the fallback path, stayed green).
+# See the constant's comment in models.py for the Carbon byte derivation.
 
 # Probe keys: a spread of virtual keys whose outputs identify the matching table
 # unambiguously. Includes alphabetic keys (distinctive on plain/shift) AND keys
@@ -220,7 +220,7 @@ def resolve_plane_tables_via_os(
         }
 
     resolved = {}
-    for plane, modifier_byte in _PLANE_MODIFIER_BYTE.items():
+    for plane, modifier_byte in PLANE_MODIFIER_BYTE.items():
         os_outputs = {}
         for vk in _PROBE_VKS:
             produced = _translate(handle, layout_ptr, kbd_type, vk, modifier_byte)
@@ -343,7 +343,9 @@ def build_os_reference(data: bytes) -> 'dict':
         'cells': { (virtual_key, plane_name): {'output': str, 'dead': bool} },
         'compositions': { (virtual_key, plane_name): { base_char: result } },
       }
-    where plane_name is one of 'plain'/'shift'/'option'/'shift_option'.
+    where plane_name is a ModifierState value ('plain' .. 'caps_shift_option'):
+    every plane in the shared PLANE_MODIFIER_BYTE, so the reference covers the
+    caps quartet as well as the base four.
 
     'cells' is every key at every plane: its produced string and whether it is a
     dead key. 'compositions' is, for each dead-key cell, the result of following
@@ -361,7 +363,7 @@ def build_os_reference(data: bytes) -> 'dict':
     buffer = ctypes.create_string_buffer(data, len(data))
     layout_ptr = ctypes.cast(buffer, ctypes.c_void_p)
 
-    plane_bytes = [(p.value, b) for p, b in _PLANE_MODIFIER_BYTE.items()]
+    plane_bytes = [(p.value, b) for p, b in PLANE_MODIFIER_BYTE.items()]
 
     cells = {}
     compositions = {}
@@ -379,8 +381,8 @@ def build_os_reference(data: bytes) -> 'dict':
                 # plain and shift base key. Record only non-empty results.
                 comp = {}
                 for base_plane, base_mod in (
-                    ('plain', _PLANE_MODIFIER_BYTE[ModifierState.PLAIN]),
-                    ('shift', _PLANE_MODIFIER_BYTE[ModifierState.SHIFT]),
+                    ('plain', PLANE_MODIFIER_BYTE[ModifierState.PLAIN]),
+                    ('shift', PLANE_MODIFIER_BYTE[ModifierState.SHIFT]),
                 ):
                     for base_vk in _REFERENCE_VKS:
                         base_char, _ = _translate_full(

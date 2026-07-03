@@ -23,7 +23,7 @@ import json
 from xml.sax.saxutils import escape as _xml_escape
 
 
-__version__ = '20260630'
+__version__ = '20260701'
 
 
 _NAMESPACE = 'keylayout_to_xkb'
@@ -43,12 +43,13 @@ class InstallPaths:
         self.symbols_dir = os.path.join(self.root, 'symbols')
         self.types_dir = os.path.join(self.root, 'types')
         self.rules_dir = os.path.join(self.root, 'rules')
-        # Symbols now live in one file PER BASE LAYOUT, named '<base>-k2x' (e.g.
-        # 'pl-k2x'), so KDE's preview finds our variant sections inside a file
-        # named after the layout it is resolving -- while NOT shadowing the real
-        # system base (a user 'symbols/pl' would replace the system Polish layout;
-        # 'symbols/pl-k2x' is a distinct file that shadows nothing). The set of
-        # these files is dynamic, so symbols_file is gone; use symbols_file_for().
+        # Symbols now live in one file PER BASE LAYOUT, named '<base>x' (e.g.
+        # 'plx', matching k2x_base_name), so the compositor finds our variant
+        # sections inside a file named after the registered layout -- while NOT
+        # shadowing the real system base (a user 'symbols/pl' would replace the
+        # system Polish layout; 'symbols/plx' is a distinct file that shadows
+        # nothing). The set of these files is dynamic, so symbols_file is gone;
+        # use symbols_file_for().
         self.types_file = os.path.join(self.types_dir, _NAMESPACE)
         self.rules_file = os.path.join(self.rules_dir, 'evdev')
         self.registry_file = os.path.join(self.rules_dir, 'evdev.xml')
@@ -57,7 +58,7 @@ class InstallPaths:
 
     def symbols_file_for(self, base_layout):
         """Path to the per-base symbols file for a base layout ('pl' -> the file
-        symbols/pl-k2x)."""
+        symbols/plx)."""
 
         return os.path.join(self.symbols_dir, k2x_base_name(base_layout))
 
@@ -134,10 +135,17 @@ def build_types_file(records):
 def build_symbols_files(records):
     """Return {base_layout: symbols_file_text}, one entry per distinct base.
 
-    Each base's file (written to symbols/<base>-k2x) holds the xkb_symbols
-    sections for every variant of every record that resolves to that base. The
-    section name is the variant name (mac-k2x-ansi/iso), which is what KDE's
-    preview and the system rules wildcard look up as <base>-k2x(<variant>).
+    Each base's file (written to symbols/<base>x, e.g. symbols/plx) holds the
+    xkb_symbols sections for every variant of every record that resolves to that
+    base. The section name is the variant name (mac-k2x-ansi/iso), which the
+    system rules wildcard resolves as <base>x(<variant>).
+
+    The FIRST section in each file is flagged 'default': the registered layout
+    is selectable WITHOUT a variant (the desktop picker always offers the bare
+    layout row), and a file with no default section is only tolerated by
+    libxkbcommon (first-section fallback, with a warning) -- the X server's own
+    compiler is stricter. The default flag makes the bare '<base>x' selection
+    well-defined everywhere instead of resolver-dependent.
     """
 
     by_base = {}
@@ -148,10 +156,15 @@ def build_symbols_files(records):
     files = {}
     for base in sorted(by_base):
         lines = [_BEGIN, '']
+        first_section = True
         for record in sorted(by_base[base], key=lambda r: r['identifier']):
             for variant_name, block_text in record['variants']:
                 _types, symbols_section = _split_variant_block(block_text)
+                flags = ('default partial alphanumeric_keys' if first_section
+                         else 'partial alphanumeric_keys')
+                first_section = False
                 lines.append('// %s : %s' % (record['identifier'], variant_name))
+                lines.append(flags)
                 lines.append(symbols_section)
                 lines.append('')
         lines.append(_END)
@@ -193,20 +206,23 @@ def _tagged_description(text):
 
 
 def build_registry_xml(records):
-    """Register our variants UNDER existing base layouts.
+    """Register each '<base>x' layout with our variants in its variantList.
 
-    libxkbregistry MERGES this file with the system registry, so emitting a
-    <layout> with an existing base's <name> (e.g. 'pl') and only OUR <variant>
-    entries adds those variants to the base's variant list -- inheriting the
-    base's flag, geometry, and grouping while staying selectable. Records are
-    grouped by base_layout (several exotic layouts may share the 'us' fallback).
+    libxkbregistry MERGES this file with the system registry. The layout name is
+    the namespaced '<base>x' (see k2x_base_name) -- a NEW layout, distinct from
+    the system base, so its symbols resolve from our symbols/<base>x file. (An
+    earlier design registered variants UNDER the existing base, but KDE then
+    derived the symbols file from the base's group and looked for our sections
+    inside e.g. 'symbols/pl', which fails.)
 
-    Only variant-level entries are emitted (no top-level custom <configItem>
-    metadata), because the base layout already supplies name/flag/short label; we
-    are augmenting it, not redefining it.
+    The layout-level configItem carries a description: the desktop picker always
+    shows the layout itself as a selectable row (resolving to the file's
+    'default' section -- see build_symbols_files), and without a description
+    that row displays the raw identifier ('plx'). Records are grouped by
+    base_layout (several exotic layouts may share the 'us' fallback).
     """
 
-    # Group records by their base layout, registered as '<base>-k2x'.
+    # Group records by their base layout, registered as '<base>x'.
     by_base = {}
     for record in records:
         base = record.get('base_layout') or 'us'
@@ -217,8 +233,13 @@ def build_registry_xml(records):
            '<xkbConfigRegistry version="1.1">', '  <layoutList>']
     for base in sorted(by_base):
         layout_name = k2x_base_name(base)
+        layout_desc = _tagged_description('Macintosh layouts (%s)' % base)
         out += ['    <layout>', '      <configItem>',
                 '        <name>%s</name>' % _xml_escape(layout_name),
+                '        <shortDescription>%s</shortDescription>'
+                % _xml_escape(base),
+                '        <description>%s</description>'
+                % _xml_escape(layout_desc),
                 '      </configItem>', '      <variantList>']
         for record in sorted(by_base[base], key=lambda r: r['identifier']):
             for variant_name, _text in record['variants']:

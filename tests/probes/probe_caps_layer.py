@@ -66,17 +66,24 @@ _bootstrap_src_on_path()
 from keylayout_to_xkb.extract.tis_source import extract_all_layouts
 from keylayout_to_xkb.extract.uckeytranslate import _load_uckeytranslate, _translate
 from keylayout_to_xkb.extract import uchr_parse as up
+from keylayout_to_xkb.common.models import (
+    ModifierState,
+    PLANE_MODIFIER_BYTE,
+)
 
 
-__version__ = '20260626'
+__version__ = '20260702'
 
 
-# Caps-layer planes: modifier byte -> human label. Caps bit is 0x04.
+# Caps-layer planes: human label -> modifier byte, derived from the SHARED
+# PLANE_MODIFIER_BYTE constant. This probe originally carried its own byte
+# list; keeping a private copy is how the production resolver's list drifted
+# out of sync with the validated bytes without anything noticing.
 _CAPS_PLANES = {
-    'caps':            0x04,
-    'caps+shift':      0x06,
-    'caps+option':     0x0C,
-    'caps+shift+opt':  0x0E,
+    'caps':            PLANE_MODIFIER_BYTE[ModifierState.CAPS],
+    'caps+shift':      PLANE_MODIFIER_BYTE[ModifierState.CAPS_SHIFT],
+    'caps+option':     PLANE_MODIFIER_BYTE[ModifierState.CAPS_OPTION],
+    'caps+shift+opt':  PLANE_MODIFIER_BYTE[ModifierState.CAPS_SHIFT_OPTION],
 }
 
 

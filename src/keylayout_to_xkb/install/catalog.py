@@ -17,7 +17,46 @@ import re
 from dataclasses import dataclass, field
 
 
-__version__ = '20260623'
+__version__ = '20260703'
+
+
+# Common non-ASCII punctuation Apple uses in layout display names, folded to
+# ASCII equivalents. The en dash in names like 'Inuktitut \u2013 Nunavik' has
+# crashed downstream ASCII-locale consumers (a keymapper layout-change callback
+# decoding the name under a C locale), so emitted names are folded to pure
+# ASCII at the point they enter the pipeline. Table first for punctuation that
+# NFKD cannot decompose, then NFKD strips diacritics for anything left.
+_ASCII_FOLD_TABLE = {
+    0x2013: '-',   # en dash
+    0x2014: '-',   # em dash
+    0x2212: '-',   # minus sign
+    0x2018: "'",   # left single quote
+    0x2019: "'",   # right single quote
+    0x201C: '"',   # left double quote
+    0x201D: '"',   # right double quote
+    0x2026: '...', # ellipsis
+    0x00A0: ' ',   # no-break space
+    0x00D7: 'x',   # multiplication sign
+}
+
+
+def fold_name_to_ascii(name: str) -> str:
+    """Fold a layout display name to pure ASCII, preserving readability.
+
+    Punctuation folds via the table (en dash -> hyphen and friends); anything
+    else decomposes via NFKD with combining marks dropped ('Maori' from
+    'M\u0101ori'). Whitespace collapses, and an empty result falls back to a
+    placeholder rather than propagating an empty name.
+    """
+
+    import unicodedata
+
+    folded = name.translate(_ASCII_FOLD_TABLE)
+    folded = unicodedata.normalize('NFKD', folded)
+    folded = folded.encode('ascii', 'ignore').decode('ascii')
+    folded = ' '.join(folded.split())
+    return folded or 'unnamed layout'
+
 
 
 @dataclass

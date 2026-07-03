@@ -27,14 +27,16 @@ Plane -> XKB modifier combination -> level:
     CAPS_SHIFT_OPTION  LevelFive+Shift+LevelThree level 8
 
 LevelFive is the standard virtual modifier the EIGHT_LEVEL system type already
-maps to levels 5-8. The emitted <CAPS> key backs it with Mod3, the system's own
-level5 real bit and the conventional free one (Mod1=Alt, Mod2=NumLock, Mod4=
-Super, Mod5=LevelThree are taken), and LOCKS that real bit via an explicit
-LockMods action, so Caps toggles the caps layer on/off exactly like macOS
-(verified on hardware: macOS Caps is a pure toggle/latch, not a hold), and
-Shift/Option then select within it. This is entirely self-contained in the
-emitted layout -- no external keymapper is required. See _render_layout for why
-each piece of the <CAPS> wiring is load-bearing.
+maps to levels 5-8. The emitted <CAPS> key backs it with the REAL Lock bit and
+LOCKS it via an explicit LockMods action, so Caps toggles the caps layer on/off
+exactly like macOS (verified on hardware: macOS Caps is a pure toggle/latch,
+not a hold), Shift/Option select within it, the Caps Lock LED tracks the layer
+(LED-driven notifications work unchanged), and caps state carries across layout
+switches in both directions like the single global caps on macOS. This is
+entirely self-contained in the emitted layout -- no external keymapper is
+required. See _render_layout for why each piece of the <CAPS> wiring is
+load-bearing, including the one known multi-layout corner on modern
+libxkbcommon.
 
 When a key's signature omits a plane (e.g. a Tibetan key with no Option output),
 that key's type simply has no level for that modifier combination: pressing it
@@ -61,7 +63,7 @@ from keylayout_to_xkb.emit.classify import (
 )
 
 
-__version__ = '20260701e'
+__version__ = '20260702b'
 
 
 # Planes in canonical level order, each with the XKB modifier-combination tokens
@@ -143,13 +145,14 @@ def _cell_token(layout: Layout, virtual_key: int, plane: ModifierState,
 # types, which KDE does not reliably load. The plane->level order above matches
 # these types exactly: Shift=L2, LevelThree=L3/L4, LevelFive=L5..L8.
 #
-# We use the PLAIN types, NOT the _ALPHABETIC variants. CapsLock feeds LevelFive
-# (via the Mod3-backed LockMods on <CAPS>), not the standard Lock modifier, so the
-# alphabetic types' Lock handling never applies -- and worse, it would be WRONG:
+# We use the PLAIN types, NOT the _ALPHABETIC variants. CapsLock locks the Lock
+# bit (which backs LevelFive), and the alphabetic types give Lock its classic
+# capitalize/shift-reverses semantics -- which would be WRONG here:
 # EIGHT_LEVEL_ALPHABETIC maps Shift+Lock+LevelThree back down to Level3 (Shift
-# "reverses" caps), which scrambles the Mac caps+Option layers (L7/L8). Plain
-# EIGHT_LEVEL selects L5..L8 cleanly from LevelFive, giving correct caps, caps+opt
-# and caps+shift+opt output for every key, letters and punctuation alike.
+# "reverses" caps), scrambling the Mac caps+Option layers (L7/L8). Plain types
+# keep Lock out of level arithmetic except through LevelFive itself, so
+# EIGHT_LEVEL selects L5..L8 cleanly, giving correct caps, caps+opt and
+# caps+shift+opt output for every key, letters and punctuation alike.
 _STANDARD_TYPE = {
     1: 'ONE_LEVEL',
     2: 'TWO_LEVEL',
@@ -235,8 +238,9 @@ def _render_layout(types: 'list', key_rows: 'dict',
 
     Two standard includes wire up the modifier layers:
       * level3(ralt_switch): RightAlt -> LevelThree (the Option/AltGr layer, L3/L4)
-      * <CAPS> -> Mod3-backed LockMods: CapsLock LOCKS LevelFive (backed by the
-        real Mod3 bit), selecting the Mac caps layer (L5..L8) with a clean
+      * <CAPS> -> Lock-backed LockMods: CapsLock LOCKS LevelFive (backed by
+        the real Lock bit, so the Caps LED tracks the caps layer), selecting
+        the Mac caps layer (L5..L8) with a clean
         toggle. Combined with plain (non-alphabetic) types
         this reproduces the full Mac model: caps uppercases letters (L5), and
         caps+Option / caps+Shift+Option reach the distinct L7/L8 glyphs (e.g.
@@ -260,57 +264,67 @@ def _render_layout(types: 'list', key_rows: 'dict',
         )
 
     lines.append('')
-    # CapsLock LOCKS LevelFive, selecting the Mac caps layer (L5..L8).
+    # CapsLock LOCKS LevelFive, selecting the Mac caps layer (L5..L8) -- and
+    # LevelFive is BACKED BY THE REAL Lock BIT, so the caps layer, the Caps
+    # Lock LED, and any LED-driven notification move together, and caps
+    # engaged here carries into sibling layouts as ordinary uppercase (and
+    # vice versa), like the single global caps on macOS.
     #
-    # The lock must land on a REAL modifier bit to persist: LevelFive is a
-    # virtual modifier, and locking a virtual modifier with no real backing
-    # evaporates (a bare ISO_Level5_Lock passed the libxkbcommon state tracker
-    # but stuck ON under real KDE). The LevelFive -> Mod3 binding therefore
-    # matters, and WHERE it lives matters just as much:
+    #   * vmods = LevelFive on <CAPS> plus modifier_map Lock { <CAPS> } binds
+    #     LevelFive to Lock. This binding is contamination-proof BY CHOICE OF
+    #     TARGET: in a multi-layout keymap the sibling groups put Caps_Lock on
+    #     this key, and symbols/pc's keysym-based 'modifier_map Lock' adds
+    #     Lock to the key's modmap -- the contaminant IS the target. (The
+    #     earlier Mod3-backed design was correct but LED-blind: nothing ever
+    #     lit the Caps LED, so LED-based notifications read a constant.)
+    #   * The explicit LockMods action lives in the SYMBOLS block, so no
+    #     compat interpret is required: compat 'complete' does NOT include
+    #     level5(level5_lock), and per-layout compat loading is unverified.
+    #     Symbols demonstrably load (Shift/AltGr work).
+    #   * The <LVL5> override neutralizes symbols/pc's stock
+    #     'key <LVL5> {[ISO_Level5_Shift]}; modifier_map Mod3 {<LVL5>};'
+    #     which otherwise binds Mod3 into LevelFive via the compat interpret.
+    #     Explicit actions suppress interprets, so single-layout keymaps and
+    #     older libxkbcommon get LevelFive = Lock exactly. On modern
+    #     libxkbcommon (1.8+) in MULTI-layout keymaps the neutralizer cannot
+    #     reach pc's Group1 (our section is group-remapped), so LevelFive
+    #     compiles as Lock+Mod3 there. Benign in normal use -- only this key
+    #     sets both bits -- with one known corner: engage caps here, DISENGAGE
+    #     it from a sibling layout, then tap caps here again, and the two bits
+    #     flip-flop (uppercase-without-caps-layer alternating with inert-off)
+    #     until one caps tap in a sibling layout re-syncs. The LED reports
+    #     every state truthfully. Upstream deleted the analogous <HYPR> line
+    #     from pc in 2.47; if <LVL5> follows, the corner disappears.
+    #   * Level 2 of <CAPS> (Shift held) is the CANCEL: LockMods with
+    #     affect=unlock unconditionally clears every bit LevelFive resolves
+    #     to -- the guaranteed escape from the corner above, verified from
+    #     the fully-locked, residue, and flip-flop states alike. It cannot
+    #     interfere with caps-layer TYPING (L6/L8 go through the letter keys,
+    #     never this key), and sibling layouts' caps is group-local and
+    #     untouched. The one deviation from macOS: Shift+Caps unlocks instead
+    #     of toggling -- accepted as the reset gesture.
     #
-    #   * The binding (vmods = LevelFive + modifier_map Mod3) lives on <LVL5>,
-    #     a PHANTOM key no hardware emits -- NOT on <CAPS>. A key's vmods field
-    #     binds the vmod to the key's ENTIRE modmap, and in a MULTI-LAYOUT
-    #     keymap <CAPS> carries Caps_Lock in the sibling groups, so symbols/pc's
-    #     keysym-based 'modifier_map Lock { Caps_Lock }' contaminates <CAPS>'s
-    #     modmap with Lock. Binding through <CAPS> then makes LevelFive =
-    #     Lock+Mod3: the caps lock starts locking the real Lock bit, leaking
-    #     caps state into the user's other layouts and re-engaging the desktop's
-    #     native caps handling. The phantom binder is immune -- this is exactly
-    #     why the stock symbols/level5(lock) binds through <HYPR> rather than
-    #     the acting key. Verified green on libxkbcommon 1.6 through master and
-    #     xkeyboard-config 2.41/2.47, single- and multi-layout, plus xkbcomp.
-    #   * Mod3 is the system's own level5 bit (symbols/pc maps <LVL5> to Mod3;
-    #     our modifier_map restates it for self-containment). Mod2/NumLock
-    #     stays untouched, so the numpad keeps working.
-    #   * <LVL5> carries a real action (SetMods) so no libxkbcommon version
-    #     skips it as an empty key (older versions dropped keys with neither
-    #     symbols nor actions, losing the vmod binding with them).
-    #   * <CAPS> carries ONLY the explicit LockMods action -- no vmods, no
-    #     modifier_map -- resolved through the global LevelFive=Mod3 binding.
-    #     The action lives in the SYMBOLS block, so no compat interpret is
-    #     required at all: compat 'complete' does NOT include
-    #     level5(level5_lock), and whether KDE loads per-layout compat is
-    #     unverified. Symbols demonstrably load (Shift/AltGr work).
-    #
-    # Because <CAPS> no longer emits the Caps_Lock keysym in THIS layout, and
-    # its modmap never feeds LevelFive, the Lock bit is never locked by this
-    # layout even when sibling layouts put Caps_Lock on the key. Plain
-    # (non-alphabetic) EIGHT_LEVEL types then map LevelFive cleanly to L5..L8,
-    # so caps+Option reaches L7 and caps+Shift+Option reaches L8 (no
-    # shift-reverses-caps collapse).
+    # Verified: libxkbcommon 1.6.0/1.8.1/1.9.2/1.10.0/1.11.0/1.12.2/master,
+    # xkeyboard-config 2.41/2.47, single- and three-layout merged keymaps,
+    # LED state asserted via xkb_state_led_name_is_active, plus xkbcomp for
+    # the X11 path. Plain (non-alphabetic) EIGHT_LEVEL types map LevelFive
+    # cleanly to L5..L8, so caps+Option reaches L7 and caps+Shift+Option
+    # reaches L8 (no shift-reverses-caps collapse).
     lines.append('    key <LVL5> {')
     lines.append('        type[Group1] = "ONE_LEVEL",')
     lines.append('        symbols[Group1] = [ NoSymbol ],')
-    lines.append('        vmods = LevelFive,')
-    lines.append('        actions[Group1] = [ SetMods(modifiers=LevelFive) ]')
+    lines.append('        actions[Group1] = [ NoAction() ]')
     lines.append('    };')
-    lines.append('    modifier_map Mod3 { <LVL5> };')
     lines.append('    key <CAPS> {')
-    lines.append('        type[Group1] = "ONE_LEVEL",')
-    lines.append('        symbols[Group1] = [ ISO_Level5_Lock ],')
-    lines.append('        actions[Group1] = [ LockMods(modifiers=LevelFive) ]')
+    lines.append('        type[Group1] = "TWO_LEVEL",')
+    lines.append('        symbols[Group1] = [ ISO_Level5_Lock, ISO_Level5_Lock ],')
+    lines.append('        vmods = LevelFive,')
+    lines.append('        actions[Group1] = [')
+    lines.append('            LockMods(modifiers=LevelFive),')
+    lines.append('            LockMods(modifiers=LevelFive, affect=unlock)')
+    lines.append('        ]')
     lines.append('    };')
+    lines.append('    modifier_map Lock { <CAPS> };')
     lines.append('')
     lines.append('    include "level3(ralt_switch)"')
     lines.append('};')

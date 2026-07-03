@@ -30,24 +30,28 @@ suite asserts result.is_clean() (or an allowed-known-divergence set).
 
 from dataclasses import dataclass, field
 
-from keylayout_to_xkb.common.debug import dbg
-from keylayout_to_xkb.common.models import Layout, OutputKind, ModifierState
+from keylayout_to_xkb.common.debug import dbg, warn
+from keylayout_to_xkb.common.models import (
+    Layout,
+    OutputKind,
+    ModifierState,
+    PLANE_MODIFIER_BYTE,
+)
 from keylayout_to_xkb.extract.uckeytranslate import (
     build_os_reference,
     OSOracleUnavailable,
 )
 
 
-__version__ = '20260623'
+__version__ = '20260702'
 
 
-# Map the model's ModifierState to the plane names the OS reference uses.
-_PLANE_NAME = {
-    ModifierState.PLAIN:        'plain',
-    ModifierState.SHIFT:        'shift',
-    ModifierState.OPTION:       'option',
-    ModifierState.SHIFT_OPTION: 'shift_option',
-}
+# The planes the audit covers, derived from the SHARED plane constant so the
+# audit can never silently agree with a resolver that dropped planes: when the
+# oracle resolver and this audit carried separate four-plane lists, a
+# four-plane extraction audited at 100% while the caps quartet was missing.
+# plane_name strings are the ModifierState values ('plain' .. 'caps_...').
+_PLANE_NAME = {plane: plane.value for plane in PLANE_MODIFIER_BYTE}
 
 
 @dataclass
@@ -119,7 +123,7 @@ def compare_reference(layout: Layout, reference: 'dict', name: str) -> Verificat
     os_comps = reference['compositions']
 
     for (vk, plane_name), os_cell in cells.items():
-        plane = next(p for p, n in _PLANE_NAME.items() if n == plane_name)
+        plane = ModifierState(plane_name)
         parser = _parser_cell(layout, vk, plane)
         os_output = os_cell['output']
         os_dead = os_cell['dead']
@@ -163,7 +167,7 @@ def compare_reference(layout: Layout, reference: 'dict', name: str) -> Verificat
 
     # Compositions: for each OS dead-key cell, compare the parser's dead state.
     for (vk, plane_name), os_comp in os_comps.items():
-        plane = next(p for p, n in _PLANE_NAME.items() if n == plane_name)
+        plane = ModifierState(plane_name)
         parser = _parser_cell(layout, vk, plane)
         if parser is None or not parser[1]:
             continue                                # parser does not see a dead key here
@@ -209,6 +213,23 @@ def verify_layout(data: bytes, name: str) -> VerificationResult:
 
     reference = build_os_reference(data)            # raises OSOracleUnavailable off mac
     layout = parse_uchr(data, layout_name=name)
+
+    # Plane-coverage cross-check: the audit must be ABLE to disagree with the
+    # resolver about which planes exist. A parser plane the OS reference never
+    # probed (or vice versa) is a sync bug in the making, not a passing grade.
+    model_planes = {
+        plane.value for outputs in layout.keys.values() for plane in outputs
+    }
+    audited_planes = {plane_name for _vk, plane_name in reference['cells']}
+    unaudited = sorted(model_planes - audited_planes)
+    if unaudited:
+        warn('oracle', '%s: parser plane(s) not covered by the OS reference: %s'
+             % (name, ', '.join(unaudited)))
+    unparsed = sorted(audited_planes - model_planes)
+    if unparsed:
+        warn('oracle', '%s: OS reference plane(s) the parser produced nothing '
+             'for: %s' % (name, ', '.join(unparsed)))
+
     result = compare_reference(layout, reference, name)
     dbg(
         'verify',

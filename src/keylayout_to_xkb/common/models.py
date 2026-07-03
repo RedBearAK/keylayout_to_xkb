@@ -40,7 +40,7 @@ import enum
 from dataclasses import dataclass, field
 
 
-__version__ = '20260623'
+__version__ = '20260702'
 
 
 class ModifierState(enum.Enum):
@@ -84,6 +84,33 @@ class ModifierState(enum.Enum):
     CAPS_OPTION         = 'caps_option'
     CAPS_SHIFT_OPTION   = 'caps_shift_option'
     UNKNOWN             = 'unknown'
+
+
+# Carbon modifier bytes for UCKeyTranslate, one per typeable plane: the
+# modifierKeyState parameter is (EventRecord modifiers >> 8), so
+# shiftKey=0x0200 -> 0x02, alphaLock=0x0400 -> 0x04, optionKey=0x0800 -> 0x08,
+# composed bitwise for the combination planes. The same bytes, +2, index the
+# on-disk keyModifiersToTableNum array (see uchr_parse._resolve_plane_tables).
+#
+# This dict is THE single source of truth for plane -> modifier byte. The OS
+# plane resolver (extract/uckeytranslate.resolve_plane_tables_via_os), the OS
+# reference builder (build_os_reference), the verify audit (verify/os_oracle),
+# the on-disk plane index in uchr_parse, and the caps-layer probe all derive
+# from it. These lists went out of sync once -- the macOS resolver stayed at
+# four planes after the content resolver grew to eight, silently dropping the
+# caps layers from every on-Mac generation while every off-Mac test stayed
+# green -- and a shared constant is what makes that drift structurally
+# impossible. Do not redeclare these bytes anywhere else.
+PLANE_MODIFIER_BYTE = {
+    ModifierState.PLAIN:             0x00,
+    ModifierState.SHIFT:             0x02,
+    ModifierState.OPTION:            0x08,
+    ModifierState.SHIFT_OPTION:      0x0A,
+    ModifierState.CAPS:              0x04,
+    ModifierState.CAPS_SHIFT:        0x06,
+    ModifierState.CAPS_OPTION:       0x0C,
+    ModifierState.CAPS_SHIFT_OPTION: 0x0E,
+}
 
 
 class OutputKind(enum.Enum):
