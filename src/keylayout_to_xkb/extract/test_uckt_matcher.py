@@ -33,7 +33,7 @@ from keylayout_to_xkb.extract import uchr_parse
 from keylayout_to_xkb.extract import uckeytranslate
 
 
-__version__ = '20260703'
+__version__ = '20260703b'
 
 
 _FIXTURE = '/mnt/user-data/uploads/com_apple_keylayout_PolishPro.uchr'
@@ -132,7 +132,12 @@ def _run_matcher_with_fake_os(pieces):
             return '', 0
         kind, output = cell
         if kind == 'dead':
-            return '', 1
+            # _table_cells records the uchr state number as the cell payload;
+            # the real UCKeyTranslate answers that same number as deadKeyState
+            # (verified on Latvian), so the fake must return it too or the
+            # strict state comparison in tie settling would never match.
+            state_number = int(output) if output.isdigit() else 1
+            return '', state_number
         return output, 0
 
     orig_load = uckeytranslate._load_uckeytranslate

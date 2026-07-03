@@ -25,7 +25,7 @@ from keylayout_to_xkb.common.debug import warn
 from keylayout_to_xkb.install.catalog import LayoutRecord
 
 
-__version__ = '20260703'
+__version__ = '20260703b'
 
 
 def _record_to_dict(record: LayoutRecord) -> 'dict':
@@ -747,7 +747,10 @@ def _module_versions():
     def _ver(module_filename):
         here = _os.path.dirname(_os.path.abspath(__file__))
         text = _read_text(_os.path.join(here, module_filename))
-        match = _re.search(r"__version__\s*=\s*'(\d{8})'", text or '')
+        # House version format is YYYYMMDD with an optional letter suffix
+        # ('20260703', '20260703b'). The pattern must accept the suffix: a
+        # digits-only match once stamped letter-bumped modules as 00000000.
+        match = _re.search(r"__version__\s*=\s*'(\d{8}[a-z]?)'", text or '')
         return match.group(1) if match else '00000000'
 
     return 'rc%s/gen%s/br%s/up%s/uckt%s' % (

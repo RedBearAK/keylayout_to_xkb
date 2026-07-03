@@ -63,16 +63,22 @@ from keylayout_to_xkb.extract.uckeytranslate import (
 )
 
 
-__version__ = '20260703b'
+__version__ = '20260703d'
 
 
-def _pieces(data):
-    """Return (char_tables, table_map, default_table, table_outputs_fn)."""
+def _pieces(data, layout_name=''):
+    """Return (char_tables, table_map, default_table, outputs_fn, cells_fn).
+
+    layout_name is threaded into the state-record parser so its warns are
+    attributed; an earlier revision parsed anonymously and produced warns
+    naming layout '' -- production (parse_uchr) always threads the name.
+    """
 
     (_first, _last, mod_off, ci, sro, _t, seqo) = struct.unpack_from(
         '<IIIIIII', data, 12)
     char_tables = uchr_parse._parse_char_table_index(data, ci)
-    state_records = uchr_parse._parse_state_records(data, sro)
+    state_records = uchr_parse._parse_state_records(
+        data, sro, layout_name=layout_name)
     sequences = uchr_parse._parse_sequence_table(data, seqo)
     table_map, default_table = uchr_parse._parse_modifier_table_map(
         data, mod_off)
@@ -81,7 +87,12 @@ def _pieces(data):
         return uchr_parse._table_outputs(
             data, char_tables[table_index], state_records, sequences)
 
-    return char_tables, table_map, default_table, table_outputs_fn
+    def table_cells_fn(table_index):
+        return uchr_parse._table_cells(
+            data, char_tables[table_index], state_records, sequences)
+
+    return (char_tables, table_map, default_table, table_outputs_fn,
+            table_cells_fn)
 
 
 def _ondisk_table(table_map, default_table, table_count, modifier_byte):
@@ -103,8 +114,23 @@ def probe_layout(name, data, handle, kbd_type):
     Returns (matcher_win_count, ondisk_win_count) across probed cells.
     """
 
-    char_tables, table_map, default_table, outputs_fn = _pieces(data)
-    matched = resolve_plane_tables_via_os(data, char_tables, outputs_fn)
+    char_tables, table_map, default_table, outputs_fn, cells_fn = _pieces(
+        data, layout_name=name)
+    ondisk_all = {
+        plane: _ondisk_table(table_map, default_table, len(char_tables), byte)
+        for plane, byte in PLANE_MODIFIER_BYTE.items()
+    }
+    # PRODUCTION PARITY: pass the dead-aware cells callback and the on-disk
+    # hint exactly as parse_uchr does. An earlier revision called the resolver
+    # bare, which ran the tie settling BLIND (dead cells invisible, no
+    # fallback hint) and flooded the log with residual-tie warns that
+    # production would never emit.
+    matched = resolve_plane_tables_via_os(
+        data, char_tables, outputs_fn,
+        table_cells_fn=cells_fn,
+        ondisk_tables=ondisk_all,
+        layout_name=name,
+    )
     if not matched:
         return 0, 0
     buffer = ctypes.create_string_buffer(data, len(data))
@@ -117,27 +143,44 @@ def probe_layout(name, data, handle, kbd_type):
                                modifier_byte)
         if picked is None or ondisk is None or picked == ondisk:
             continue
-        outs_picked = outputs_fn(picked)
-        outs_ondisk = outputs_fn(ondisk)
-        differing = sorted(vk for vk in set(outs_picked) | set(outs_ondisk)
-                           if outs_picked.get(vk) != outs_ondisk.get(vk))
+        cells_picked = cells_fn(picked)
+        cells_ondisk = cells_fn(ondisk)
+        differing = sorted(vk for vk in set(cells_picked) | set(cells_ondisk)
+                           if cells_picked.get(vk) != cells_ondisk.get(vk))
         if not differing:
             continue
         print('  %s plane %s: matcher=%d ondisk=%d, %d differing cell(s):'
               % (name, plane.value, picked, ondisk, len(differing)))
+
+        def cell_agrees(cell, os_out, dead_state):
+            # Mirrors _settle_table_tie: dead answers match dead cells with
+            # the SAME state number; char answers match char cells; empty
+            # answers match absent cells.
+            if dead_state:
+                return (cell is not None and cell[0] == 'dead'
+                        and (not cell[1] or cell[1] == str(dead_state)))
+            if os_out:
+                return (cell is not None and cell[0] == 'char'
+                        and cell[1] == os_out)
+            return cell is None
+
         for vk in differing[:6]:
             os_out, dead_state = _translate_full(
                 handle, layout_ptr, kbd_type, vk, modifier_byte)
-            cell_picked = outs_picked.get(vk)
-            cell_ondisk = outs_ondisk.get(vk)
+            cell_picked = cells_picked.get(vk)
+            cell_ondisk = cells_ondisk.get(vk)
             verdict = ('DEAD(state=%d)' % dead_state) if dead_state \
                 else repr(os_out)
-            if os_out == cell_ondisk:
+            picked_ok = cell_agrees(cell_picked, os_out, dead_state)
+            ondisk_ok = cell_agrees(cell_ondisk, os_out, dead_state)
+            if ondisk_ok and not picked_ok:
                 agrees = 'ondisk'
                 ondisk_wins += 1
-            elif os_out == cell_picked:
+            elif picked_ok and not ondisk_ok:
                 agrees = 'matcher'
                 matcher_wins += 1
+            elif picked_ok and ondisk_ok:
+                agrees = 'both'
             else:
                 agrees = 'NEITHER'
             print('    vk 0x%02x: OS=%s  matcher_cell=%r  ondisk_cell=%r'
@@ -177,7 +220,9 @@ def main(argv):
     elif total_matcher or total_ondisk:
         print('VERDICT: mixed -- both mechanisms in play; send this output.')
     else:
-        print('no disagreement cells found for the given filters.')
+        print('no cell took a side (no disagreements remain, or every '
+              'probed cell agreed with both/neither candidate -- see rows '
+              'above, and send this output if any rows printed).')
     return 0
 
 

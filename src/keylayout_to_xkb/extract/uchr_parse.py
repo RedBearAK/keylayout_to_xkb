@@ -33,7 +33,7 @@ from keylayout_to_xkb.common.gestalt_keyboard import (
 )
 
 
-__version__ = '20260703'
+__version__ = '20260703d'
 
 
 _EXPECTED_HEADER_FORMAT     = 0x1002
@@ -292,7 +292,8 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '',
     sequences = _parse_sequence_table(data, sequence_data_offset)
     dbg('uchr', f'sequences: {len(sequences)}')
 
-    state_records = _parse_state_records(data, state_records_offset)
+    state_records = _parse_state_records(
+        data, state_records_offset, layout_name=layout_name)
     dbg('uchr', f'state records: {len(state_records)}')
 
     # The two index flags on a char-table entry are governed independently:
@@ -348,6 +349,7 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '',
             data, char_tables, table_outputs_for,
             table_cells_fn=table_cells_for,
             ondisk_tables=content_tables,
+            layout_name=layout_name,
         )
     except Exception as os_error:                       # never let OS path abort
         warn('uchr', f'{layout_name!r}: UCKeyTranslate path errored '
@@ -605,7 +607,11 @@ def _table_cells(
         if ko is None:
             continue
         if ko.kind is OutputKind.DEAD:
-            cells[virtual_key] = ('dead', '')
+            # The state name IS the OS discriminator: UCKeyTranslate's
+            # deadKeyState equals the uchr state number (verified: Latvian
+            # table 8 vk 0x27 has state '1' and the OS answers DEAD(state=1)),
+            # so two dead cells entering different states are distinguishable.
+            cells[virtual_key] = ('dead', ko.dead_state_name or '')
         elif ko.kind is OutputKind.CHARS and ko.output and len(ko.output) == 1:
             cells[virtual_key] = ('char', ko.output)
     return cells
@@ -815,7 +821,8 @@ def _parse_terminators(
     return terminators
 
 
-def _parse_state_records(data: bytes, offset: int) -> 'list[dict]':
+def _parse_state_records(data: bytes, offset: int,
+                         layout_name: str = '') -> 'list[dict]':
     """Read keyStateRecordsIndex; return decoded record dicts indexed by record.
 
     Header: u16 marker (0x5001), u16 count, then count absolute u32 offsets.
@@ -837,7 +844,8 @@ def _parse_state_records(data: bytes, offset: int) -> 'list[dict]':
     if record_count == 0:
         return []
     if record_count > 1024:
-        warn('uchr', f'large state record count={record_count}; verify offset')
+        warn('uchr', f'{layout_name!r}: large state record count={record_count}; '
+             'verify offset')
 
     offsets_base = offset + 4
     _check_bounds(data, offsets_base, 4 * record_count, 'state-record offsets')
@@ -879,13 +887,15 @@ def _parse_state_records(data: bytes, offset: int) -> 'list[dict]':
                 entries.append((cur_state, char_data))
         elif entry_format == _RANGE_ENTRY_FORMAT:
             entries = _parse_range_record_entries(
-                data, record_offset, _record_end_for(record_offset), record_index
+                data, record_offset, _record_end_for(record_offset),
+                record_index, layout_name=layout_name,
             )
         elif entry_format not in (0, _TERMINAL_ENTRY_FORMAT):
             warn(
                 'uchr',
-                f'state record[{record_index}] entry format '
-                f'0x{entry_format:04x} not handled; {entry_count} entries skipped'
+                f'{layout_name!r}: state record[{record_index}] entry '
+                f'format 0x{entry_format:04x} not handled; '
+                f'{entry_count} entries skipped'
             )
 
         records.append({
@@ -903,53 +913,70 @@ def _parse_range_record_entries(
     record_offset: int,
     record_end: int,
     record_index: int,
+    layout_name: str = '',
 ) -> 'list[tuple[int, int]]':
-    """Best-effort decode of a format-2 (range) state record.
+    """Decode a format-2 (range) state record per its PROVEN grammar.
 
-    Format-2 records encode polytonic / stacked dead-key chaining (Greek
-    Polytonic, Tibetan, a few Native American layouts). Verified layout: after
-    the 8-byte record header come 8-byte range entries (u16 curStateStart,
-    u8 curStateRange, u8 deltaMultiplier, u16 charData, u16 nextState), a
-    0xFFFF-curStateStart sentinel, then a nested format-1 terminal record
-    (u16 zeroChar, u16 nextState, u16 count, u16 format==1, then count
-    (curState, charData) pairs) carrying the real compositions.
+    Format-2 records encode stacked dead-key chaining (Greek Polytonic,
+    Tibetan, a few Native American layouts). The record is exactly:
 
-    Some records nest multiple blocks recursively; rather than chase a graph
-    that varies per script, this extracts the first cleanly-formed nested
-    terminal block (the common high-value case: a base letter's full accent
-    set) and is strictly bounded by record_end so it can never read into the
-    next record. curStateRange/deltaMultiplier are 0/1 in every observed
-    layout, so single-state coverage is assumed. Records whose nested block is
-    not a simple terminal are skipped with a warning rather than guessed.
+      u16 zeroChar, u16 nextState, u16 entryCount, u16 entryFormat(==2),
+      entryCount x 8-byte entries of
+        (u16 curStateStart, u8 curStateRange, u8 deltaMultiplier,
+         u16 charData, u16 nextState)
+
+    and NOTHING else: no sentinel, no nested terminal block. Proven on
+    Tibetan-Wylie, where 27 of 28 format-2 records tile flush against their
+    successor at exactly 8 + 8*entryCount bytes and the 28th tiles flush
+    against the global 0x6001 terminators table. An earlier decode assumed a
+    0xFFFF sentinel plus a nested format-1 terminal, so it read past each
+    record's true end and absorbed the NEXT record's header and entries as
+    compositions -- state-misattributed entries in every format-2 layout, and
+    the fmt=0x04ce warn wherever the neighbour was not a plausible terminal.
+
+    An entry with charData 0xFFFF (or the 0xFFFE empty) emits nothing: it
+    CHAINS to a deeper state (nextState). The single-level composition model
+    skips those, loudly counted, until multi-level chains are modeled. A
+    non-zero curStateRange covers curStateStart..+range with charData
+    advancing by deltaMultiplier per step (0/1 in every observed layout, so
+    the expansion degenerates to a single pair today).
     """
 
+    (_zero_char, _next_state, entry_count, _entry_format) = struct.unpack_from(
+        '<HHHH', data, record_offset)
+
+    available = max((record_end - record_offset - 8) // 8, 0)
+    if entry_count > available:
+        warn(
+            'uchr',
+            f'{layout_name!r}: state record[{record_index}] format-2 entry '
+            f'count {entry_count} overruns the record span '
+            f'({available} entries fit); clamping'
+        )
+        entry_count = available
+
     entries = []
-    offset = record_offset + 8
+    chain_count = 0
+    for entry_index in range(entry_count):
+        base = record_offset + 8 + 8 * entry_index
+        (cur_state_start, cur_state_range, delta_multiplier, char_data,
+         chain_next_state) = struct.unpack_from('<HBBHH', data, base)
+        if char_data in (_OUTPUT_EMPTY_A, _OUTPUT_EMPTY_B):
+            chain_count += 1
+            continue
+        for step in range(cur_state_range + 1):
+            entries.append((
+                cur_state_start + step,
+                char_data + step * delta_multiplier,
+            ))
 
-    while offset + 8 <= record_end:
-        cur_state_start = struct.unpack_from('<H', data, offset)[0]
-        if cur_state_start == _OUTPUT_EMPTY_B:
-            offset += 8
-            break
-        char_data = struct.unpack_from('<H', data, offset + 4)[0]
-        if char_data not in (_OUTPUT_EMPTY_A, _OUTPUT_EMPTY_B):
-            entries.append((cur_state_start, char_data))
-        offset += 8
-
-    if offset + 8 <= record_end:
-        n_zero, n_next, n_count, n_fmt = struct.unpack_from('<HHHH', data, offset)
-        if n_fmt == _TERMINAL_ENTRY_FORMAT and offset + 8 + 4 * n_count <= record_end:
-            for entry_index in range(n_count):
-                cur_state, char_data = struct.unpack_from(
-                    '<HH', data, offset + 8 + 4 * entry_index
-                )
-                entries.append((cur_state, char_data))
-        else:
-            warn(
-                'uchr',
-                f'state record[{record_index}] format-2 nested block not a simple '
-                f'terminal (fmt=0x{n_fmt:04x}); partial decode'
-            )
+    if chain_count:
+        dbg(
+            'uchr',
+            f'{layout_name!r}: state record[{record_index}]: {chain_count} '
+            'non-emitting entr(y/ies) chain to deeper states; skipped '
+            '(single-level composition model)'
+        )
 
     return entries
 
@@ -1222,6 +1249,7 @@ def _verify_plane_assignment(
     if plain_table is not None and shift_table is not None and plain_table != shift_table:
         differing = 0
         comparable = 0
+        sampled_chars = []
         for vk in _SANITY_LETTER_VKS:
             plain_ko = layout.keys.get(vk, {}).get(ModifierState.PLAIN)
             shift_ko = layout.keys.get(vk, {}).get(ModifierState.SHIFT)
@@ -1230,15 +1258,31 @@ def _verify_plane_assignment(
             if plain_ko.kind is not OutputKind.CHARS or shift_ko.kind is not OutputKind.CHARS:
                 continue
             comparable += 1
+            sampled_chars.append(plain_ko.output)
             if plain_ko.output != shift_ko.output:
                 differing += 1
         if comparable and differing == 0:
-            warn(
-                'uchr',
-                f'{layout.name!r} plane sanity: plain and shift planes are '
-                'identical for all sampled letter keys; modifier-plane '
-                'resolution may be wrong'
+            # Caseless scripts (kana, hangul jamo, most Indic) GENUINELY have
+            # identical plain and shift letters -- KANA and 2-Set Korean fired
+            # this warn while being parsed correctly. Only cased sampled
+            # characters make identical planes suspicious.
+            any_cased = any(
+                ch and ch.lower() != ch.upper()
+                for output in sampled_chars for ch in output
             )
+            if any_cased:
+                warn(
+                    'uchr',
+                    f'{layout.name!r} plane sanity: plain and shift planes '
+                    'are identical for all sampled letter keys; '
+                    'modifier-plane resolution may be wrong'
+                )
+            else:
+                dbg(
+                    'uchr',
+                    f'{layout.name!r}: plain==shift for sampled letters, all '
+                    'caseless (expected for this script); not warning'
+                )
     elif plain_table is not None and shift_table is not None and plain_table == shift_table:
         warn(
             'uchr',

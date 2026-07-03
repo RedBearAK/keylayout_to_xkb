@@ -45,7 +45,7 @@ from keylayout_to_xkb.common.models import (
 )
 
 
-__version__ = '20260703'
+__version__ = '20260703b'
 
 
 def _utf16_units_to_str(out_buffer, length: int) -> str:
@@ -186,6 +186,7 @@ def resolve_plane_tables_via_os(
     table_outputs_fn,
     table_cells_fn=None,
     ondisk_tables=None,
+    layout_name='',
 ) -> 'dict | None':
     """Authoritatively resolve plane -> table index using UCKeyTranslate.
 
@@ -263,6 +264,7 @@ def resolve_plane_tables_via_os(
                 resolved[plane] = _settle_table_tie(
                     plane, candidates, modifier_byte, handle, layout_ptr,
                     kbd_type, table_outputs_fn, table_cells_fn, ondisk_tables,
+                    layout_name,
                 )
         else:
             dbg(
@@ -303,7 +305,7 @@ _REFERENCE_VKS = tuple(range(0, 0x35)) + (0x52, 0x5d, 0x5e)
 
 def _settle_table_tie(plane, candidates, modifier_byte, handle, layout_ptr,
                       kbd_type, table_outputs_fn, table_cells_fn,
-                      ondisk_tables):
+                      ondisk_tables, layout_name=''):
     """Settle a probe-key tie among candidate tables for one plane.
 
     Content-identical duplicates are a legitimate tie: pick the lowest index
@@ -344,7 +346,13 @@ def _settle_table_tie(plane, candidates, modifier_byte, handle, layout_ptr,
         for index in candidates:
             cell = cells[index].get(vk)
             if dead_state:
-                agrees = cell is not None and cell[0] == 'dead'
+                # The OS deadKeyState equals the uchr state number, so a dead
+                # answer discriminates BETWEEN dead cells too (Kildin Sami's
+                # caps_option twins differ only in which accent state the
+                # cells enter). An empty recorded name (outputs-only fallback)
+                # stays lenient.
+                agrees = (cell is not None and cell[0] == 'dead'
+                          and (not cell[1] or cell[1] == str(dead_state)))
             elif os_output:
                 agrees = (cell is not None and cell[0] == 'char'
                           and cell[1] == os_output)
@@ -357,7 +365,7 @@ def _settle_table_tie(plane, candidates, modifier_byte, handle, layout_ptr,
     winners = sorted(index for index, tally in tallies.items()
                      if tally == best_tally)
     if len(winners) == 1:
-        dbg('uckt', f'plane {plane.value}: tie among tables '
+        dbg('uckt', f'{layout_name!r} plane {plane.value}: tie among tables '
             f'{candidates} settled at differing cells -> {winners[0]}')
         return winners[0]
 
@@ -366,7 +374,8 @@ def _settle_table_tie(plane, candidates, modifier_byte, handle, layout_ptr,
         fallback = ondisk_tables.get(plane)
     if fallback is None:
         fallback = winners[0]
-    warn('uckt', f'plane {plane.value}: {len(winners)} NON-identical tables '
+    warn('uckt', f'{layout_name!r} plane {plane.value}: '
+         f'{len(winners)} NON-identical tables '
          f'{winners} still tie after probing their differing cells; the '
          f'native decision rule is not understood here. Using table '
          f'{fallback} (on-disk pick when available).')
