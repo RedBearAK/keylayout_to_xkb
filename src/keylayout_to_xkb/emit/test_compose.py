@@ -25,6 +25,7 @@ from keylayout_to_xkb.emit.classify import char_to_keysym, dead_state_keysym
 
 
 _FIXTURE = '/mnt/user-data/uploads/com_apple_keylayout_PolishPro.uchr'
+_WYLIE_FIXTURE = ('/mnt/user-data/uploads/com_apple_keylayout_Tibetan-Wylie.uchr')
 
 
 def _polish_pro_layout():
@@ -128,12 +129,85 @@ def test_multicodepoint_result_supported() -> bool:
     return ok
 
 
+def test_chain_sequences_fabricated() -> bool:
+    """A fabricated chain graph emits a multi-key sequence line.
+
+    Ground state '1' (acute-like terminator) chains via the dead key of
+    ground state '2' into deep state '9', where base 'a' composes. The
+    emitted file must contain the full three-key sequence with the deep
+    result, proving the walk follows dead_transitions into non-ground states.
+    """
+
+    from keylayout_to_xkb.common.models import DeadState, Layout
+
+    layout = Layout(name='chain-test', source_id='')
+    layout.dead_states['1'] = DeadState(
+        name='1', terminator='\u00b4', compositions={'e': '\u00e9'},
+        dead_transitions={'2': '9'})
+    layout.dead_states['2'] = DeadState(
+        name='2', terminator='\u02c6', compositions={'o': '\u00f4'})
+    layout.dead_states['9'] = DeadState(
+        name='9', compositions={'a': '\u01ce'}, ground=False)
+
+    text = emit_compose(layout)
+    sequence_lines = [ln for ln in text.split('\n') if ln.startswith('<')]
+    three_key = [ln for ln in sequence_lines
+                 if ln.split(':')[0].count('<') == 3]
+    if not three_key:
+        print('  no three-key sequence emitted for the chained deep state')
+        return False
+    hit = [ln for ln in three_key if '\u01ce' in ln]
+    if not hit:
+        print('  three-key sequence lacks the deep-state result: %r'
+              % three_key[:2])
+        return False
+    if not any(ln.startswith('<') and ' <a>' in ln for ln in hit):
+        print('  deep sequence does not end on base <a>: %r' % hit[:2])
+        return False
+    print('  chained deep state emitted as %s' % hit[0].split(':')[0].strip())
+    return True
+
+
+def test_chain_sequences_wylie() -> bool:
+    """Tibetan Wylie emits hundreds of multi-key stacking sequences.
+
+    Wylie carries 54 chain transitions and 445 dead-key-triggered outputs
+    reaching depth 4; the emitted XCompose must contain sequences of three or
+    more keys, and none keyed by garbage high-plane bases (the raw-chr(zero)
+    misdecode this feature's development uncovered).
+    """
+
+    if not os.path.isfile(_WYLIE_FIXTURE):
+        print('  skipped (Tibetan-Wylie fixture missing)')
+        return True
+    with open(_WYLIE_FIXTURE, 'rb') as handle:
+        data = handle.read()
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):
+        layout = parse_uchr(data, layout_name='Tibetan - Wylie')
+    text = emit_compose(layout)
+    heads = [ln.split(':')[0] for ln in text.split('\n')
+             if ln.startswith('<')]
+    deep = sum(1 for head in heads if head.count('<') >= 3)
+    garbage = sum(1 for head in heads if '<U8' in head or '<U9' in head)
+    if deep < 100:
+        print('  only %d sequences of 3+ keys (expected hundreds)' % deep)
+        return False
+    if garbage:
+        print('  %d sequences keyed by garbage high-plane bases' % garbage)
+        return False
+    print('  %d stacking sequences of 3+ keys, no garbage bases' % deep)
+    return True
+
+
 def main() -> int:
     tests = [
         ('round trip', test_round_trip),
         ('canonical polish', test_canonical_polish),
         ('syntax well-formed', test_syntax_wellformed),
         ('multi-codepoint supported', test_multicodepoint_result_supported),
+        ('chain sequences (fabricated)', test_chain_sequences_fabricated),
+        ('chain sequences (Tibetan Wylie)', test_chain_sequences_wylie),
     ]
     print('compose emitter tests:\n')
     passed = 0

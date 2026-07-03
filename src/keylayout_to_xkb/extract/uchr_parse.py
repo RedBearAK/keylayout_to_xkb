@@ -33,7 +33,7 @@ from keylayout_to_xkb.common.gestalt_keyboard import (
 )
 
 
-__version__ = '20260703d'
+__version__ = '20260703e'
 
 
 _EXPECTED_HEADER_FORMAT     = 0x1002
@@ -875,6 +875,7 @@ def _parse_state_records(data: bytes, offset: int,
             struct.unpack_from('<HHHH', data, record_offset)
 
         entries = []
+        transitions = []
         if entry_format == _TERMINAL_ENTRY_FORMAT and entry_count:
             _check_bounds(
                 data, record_offset + 8, 4 * entry_count,
@@ -886,7 +887,7 @@ def _parse_state_records(data: bytes, offset: int,
                 )
                 entries.append((cur_state, char_data))
         elif entry_format == _RANGE_ENTRY_FORMAT:
-            entries = _parse_range_record_entries(
+            entries, transitions = _parse_range_record_entries(
                 data, record_offset, _record_end_for(record_offset),
                 record_index, layout_name=layout_name,
             )
@@ -903,6 +904,7 @@ def _parse_state_records(data: bytes, offset: int,
             'next': next_state,
             'fmt': entry_format,
             'entries': entries,
+            'transitions': transitions,
         })
 
     return records
@@ -925,7 +927,9 @@ def _parse_range_record_entries(
         (u16 curStateStart, u8 curStateRange, u8 deltaMultiplier,
          u16 charData, u16 nextState)
 
-    and NOTHING else: no sentinel, no nested terminal block. Proven on
+    and NOTHING else: no sentinel, no nested terminal block. Returns
+    (entries, transitions): entries are (cur_state, char_data) output pairs,
+    transitions are (cur_state, next_state) chain pairs. Proven on
     Tibetan-Wylie, where 27 of 28 format-2 records tile flush against their
     successor at exactly 8 + 8*entryCount bytes and the 28th tiles flush
     against the global 0x6001 terminators table. An earlier decode assumed a
@@ -935,11 +939,11 @@ def _parse_range_record_entries(
     the fmt=0x04ce warn wherever the neighbour was not a plausible terminal.
 
     An entry with charData 0xFFFF (or the 0xFFFE empty) emits nothing: it
-    CHAINS to a deeper state (nextState). The single-level composition model
-    skips those, loudly counted, until multi-level chains are modeled. A
-    non-zero curStateRange covers curStateStart..+range with charData
-    advancing by deltaMultiplier per step (0/1 in every observed layout, so
-    the expansion degenerates to a single pair today).
+    CHAINS to a deeper state (nextState); those become transition pairs that
+    _build_dead_states wires into the DeadState chain graph. A non-zero
+    curStateRange covers curStateStart..+range with charData advancing by
+    deltaMultiplier per step (0/1 in every observed layout, so the expansion
+    degenerates to a single pair today).
     """
 
     (_zero_char, _next_state, entry_count, _entry_format) = struct.unpack_from(
@@ -956,13 +960,19 @@ def _parse_range_record_entries(
         entry_count = available
 
     entries = []
-    chain_count = 0
+    transitions = []
     for entry_index in range(entry_count):
         base = record_offset + 8 + 8 * entry_index
         (cur_state_start, cur_state_range, delta_multiplier, char_data,
          chain_next_state) = struct.unpack_from('<HBBHH', data, base)
         if char_data in (_OUTPUT_EMPTY_A, _OUTPUT_EMPTY_B):
-            chain_count += 1
+            # A non-emitting entry CHAINS to a deeper state: pressing this
+            # record's key while in cur_state enters chain_next_state
+            # (Tibetan stacking, polytonic breathing+accent, ...).
+            if chain_next_state > 0:
+                for step in range(cur_state_range + 1):
+                    transitions.append(
+                        (cur_state_start + step, chain_next_state))
             continue
         for step in range(cur_state_range + 1):
             entries.append((
@@ -970,15 +980,7 @@ def _parse_range_record_entries(
                 char_data + step * delta_multiplier,
             ))
 
-    if chain_count:
-        dbg(
-            'uchr',
-            f'{layout_name!r}: state record[{record_index}]: {chain_count} '
-            'non-emitting entr(y/ies) chain to deeper states; skipped '
-            '(single-level composition model)'
-        )
-
-    return entries
+    return entries, transitions
 
 
 def _resolve_char_data(
@@ -1044,10 +1046,28 @@ def _build_dead_states(
     """
 
     base_char_for_record = {}
+    multi_char_bases = 0
     for record_index, record in enumerate(state_records):
         zero = record['zero']
-        if zero not in (_OUTPUT_EMPTY_A, _OUTPUT_EMPTY_B):
-            base_char_for_record[record_index] = chr(zero)
+        if zero in (_OUTPUT_EMPTY_A, _OUTPUT_EMPTY_B):
+            continue
+        # 'zero' uses the SAME output-reference grammar as every other output
+        # site (see _resolve_char_data): a raw chr() here turned flagged
+        # sequence references into garbage base characters (e.g. chr(0x8000)
+        # showing up as a <U8000> compose base). A ground output that resolves
+        # to MULTIPLE codepoints cannot serve as a single compose base keysym;
+        # those are counted and skipped.
+        resolved = _resolve_char_data(zero, sequences)
+        if not resolved:
+            continue
+        if len(resolved) > 1:
+            multi_char_bases += 1
+            continue
+        base_char_for_record[record_index] = resolved
+
+    if multi_char_bases:
+        dbg('uchr', f'{layout.name!r}: {multi_char_bases} state record(s) '
+            'have multi-codepoint ground outputs; unusable as compose bases')
 
     for record in state_records:
         if record['zero'] != _OUTPUT_EMPTY_B:
@@ -1064,17 +1084,59 @@ def _build_dead_states(
             dead_state.terminator = terminators[terminator_index]
         layout.dead_states[name] = dead_state
 
+    def _ensure_state(state_number):
+        """The DeadState for a state number, creating a NON-ground one for
+        chain-target / entry states that no key enters directly."""
+
+        name = str(state_number)
+        dead_state = layout.dead_states.get(name)
+        if dead_state is None:
+            dead_state = DeadState(name=name, ground=False)
+            terminator_index = state_number - 1
+            if 0 <= terminator_index < len(terminators):
+                dead_state.terminator = terminators[terminator_index]
+            layout.dead_states[name] = dead_state
+        return dead_state
+
+    unaddressable = 0
     for record_index, record in enumerate(state_records):
         base_char = base_char_for_record.get(record_index)
-        if base_char is None:
-            continue
+        # The in-state TRIGGER identity of this record's key: a literal char
+        # (keyed by it, as compositions always were) or a dead key (keyed by
+        # the ground state it enters, which is what the compose emitter can
+        # name). A record with neither (empty zero, next <= 0) belongs to a
+        # chain-continuation key that emits nothing from ground; its entries
+        # cannot appear in a keysym sequence, so they are counted and skipped.
+        trigger_state = None
+        if base_char is None and record['zero'] == _OUTPUT_EMPTY_B                 and record['next'] > 0:
+            trigger_state = str(record['next'])
+
         for cur_state, char_data in record['entries']:
-            dead_state = layout.dead_states.get(str(cur_state))
-            if dead_state is None:
+            if base_char is None and trigger_state is None:
+                unaddressable += 1
                 continue
-            dead_state.compositions[base_char] = _resolve_char_data(
-                char_data, sequences
-            )
+            dead_state = _ensure_state(cur_state)
+            result = _resolve_char_data(char_data, sequences)
+            if base_char is not None:
+                dead_state.compositions[base_char] = result
+            else:
+                dead_state.dead_compositions[trigger_state] = result
+
+        for cur_state, next_state in record.get('transitions', ()):
+            if base_char is None and trigger_state is None:
+                unaddressable += 1
+                continue
+            dead_state = _ensure_state(cur_state)
+            _ensure_state(next_state)
+            if base_char is not None:
+                dead_state.char_transitions[base_char] = str(next_state)
+            else:
+                dead_state.dead_transitions[trigger_state] = str(next_state)
+
+    if unaddressable:
+        dbg('uchr', f'{layout.name!r}: {unaddressable} in-state entr(y/ies) '
+            'belong to keys with no ground identity; not expressible as '
+            'compose sequences')
 
 
 def _populate_keys(

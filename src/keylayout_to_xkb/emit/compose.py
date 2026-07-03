@@ -38,7 +38,7 @@ from keylayout_to_xkb.emit.classify import (
 )
 
 
-__version__ = '20260623'
+__version__ = '20260703'
 
 
 def _escape_result(text: str) -> str:
@@ -57,6 +57,115 @@ def _codepoint_comment(text: str) -> str:
 
     points = ' '.join('U+{:04X}'.format(ord(ch)) for ch in text)
     return points
+
+
+# Stacked dead-key chains bound: Tibetan Wylie reaches depth 4; the cap only
+# guards against a malformed cyclic graph ever looping the walk.
+_MAX_CHAIN_DEPTH = 6
+
+
+def _state_trigger(state_name, dead_state, placeholders):
+    """The keysym that TRIGGERS a ground dead state, plus its section header.
+
+    Named dead_* keysym when one matches the state's accent; else the PUA
+    placeholder the symbols emitter placed. (None, None) with a warning when
+    neither exists (the symbols emitter would also have skipped the key).
+    """
+
+    dead_keysym = dead_state_keysym(dead_state.terminator, dead_state.compositions)
+    if dead_keysym is not None:
+        header = '# %s  (terminator %r)' % (dead_keysym, dead_state.terminator)
+        return dead_keysym, header
+    trigger = placeholders['deadkey'].get(state_name)
+    if trigger is None:
+        warn('compose',
+             f'dead state {state_name!r} has neither a dead_* keysym nor '
+             f'a placeholder; skipping (this should not happen)')
+        return None, None
+    header = ('# %s  PUA placeholder dead key for terminator %r '
+              '(no standard dead_* keysym exists for it)'
+              % (trigger, dead_state.terminator))
+    return trigger, header
+
+
+def _emit_state_lines(layout, placeholders, dead_state, path_syms, visited,
+                      lines):
+    """Emit every sequence reachable from 'dead_state' along 'path_syms'.
+
+    Walks the chain graph depth-first: literal compositions first (identical
+    to the historical single-level output when the graph is chain-free), then
+    dead-key-triggered outputs, then recursion through char and dead
+    transitions. 'visited' holds the state names already on THIS path (cycle
+    guard); _MAX_CHAIN_DEPTH bounds pathological graphs. Returns the number
+    of sequence lines emitted.
+    """
+
+    count = 0
+    prefix = ' '.join('<%s>' % sym for sym in path_syms)
+    state_name = dead_state.name
+
+    for base_char, result in sorted(dead_state.compositions.items()):
+        if not base_char:
+            continue
+        base_keysym = char_to_keysym(base_char)
+        if base_keysym is None:
+            warn('compose',
+                 f'composition base {base_char!r} in state {state_name!r} '
+                 f'has no single keysym; skipping that entry')
+            continue
+        lines.append('%s <%s>\t: "%s"\t# %s'
+                     % (prefix, base_keysym, _escape_result(result),
+                        _codepoint_comment(result)))
+        count += 1
+
+    def _trigger_sym_for(trigger_state_name):
+        trigger_state = layout.dead_states.get(trigger_state_name)
+        if trigger_state is None or not trigger_state.ground:
+            warn('compose',
+                 f'in-state trigger references state {trigger_state_name!r} '
+                 f'with no ground dead key; skipping')
+            return None
+        sym, _hdr = _state_trigger(trigger_state_name, trigger_state,
+                                   placeholders)
+        return sym
+
+    for trigger_state_name, result in sorted(
+            dead_state.dead_compositions.items()):
+        trigger_sym = _trigger_sym_for(trigger_state_name)
+        if trigger_sym is None:
+            continue
+        lines.append('%s <%s>\t: "%s"\t# %s'
+                     % (prefix, trigger_sym, _escape_result(result),
+                        _codepoint_comment(result)))
+        count += 1
+
+    if len(path_syms) >= _MAX_CHAIN_DEPTH:
+        return count
+
+    for base_char, next_name in sorted(dead_state.char_transitions.items()):
+        next_state = layout.dead_states.get(next_name)
+        if next_state is None or next_name in visited:
+            continue
+        base_keysym = char_to_keysym(base_char)
+        if base_keysym is None:
+            continue
+        count += _emit_state_lines(
+            layout, placeholders, next_state, path_syms + (base_keysym,),
+            visited | {next_name}, lines)
+
+    for trigger_state_name, next_name in sorted(
+            dead_state.dead_transitions.items()):
+        next_state = layout.dead_states.get(next_name)
+        if next_state is None or next_name in visited:
+            continue
+        trigger_sym = _trigger_sym_for(trigger_state_name)
+        if trigger_sym is None:
+            continue
+        count += _emit_state_lines(
+            layout, placeholders, next_state, path_syms + (trigger_sym,),
+            visited | {next_name}, lines)
+
+    return count
 
 
 def emit_compose(layout: Layout, header_note: str = '') -> str:
@@ -80,24 +189,14 @@ def emit_compose(layout: Layout, header_note: str = '') -> str:
 
     total = 0
     for state_name, dead_state in sorted(layout.dead_states.items()):
-        dead_keysym = dead_state_keysym(dead_state.terminator, dead_state.compositions)
-        if dead_keysym is not None:
-            trigger = dead_keysym
-            header = '# %s  (terminator %r)' % (dead_keysym, dead_state.terminator)
-        else:
-            # No standard dead_* keysym for this accent (e.g. a numero sign, or a
-            # Vietnamese base-vowel tone key). Use the dead-state PUA placeholder
-            # the symbols emitter placed on the level, and document what it is so
-            # the file stays comprehensible despite the opaque codepoint.
-            trigger = placeholders['deadkey'].get(state_name)
-            if trigger is None:
-                warn('compose',
-                     f'dead state {state_name!r} has neither a dead_* keysym nor '
-                     f'a placeholder; skipping (this should not happen)')
-                continue
-            header = ('# %s  PUA placeholder dead key for terminator %r '
-                      '(no standard dead_* keysym exists for it)'
-                      % (trigger, dead_state.terminator))
+        if not dead_state.ground:
+            # Deep chain-target states are reachable only THROUGH paths from a
+            # ground state; the walk below emits their content with the full
+            # key sequence. They have no level-1 dead key of their own.
+            continue
+        trigger, header = _state_trigger(state_name, dead_state, placeholders)
+        if trigger is None:
+            continue
 
         lines.append(header)
 
@@ -105,6 +204,8 @@ def emit_compose(layout: Layout, header_note: str = '') -> str:
         # the dead key emits when followed by a non-composing key). Named dead
         # keys get this from the host Compose; placeholder dead keys need it
         # stated explicitly so the bare press is not lost.
+        dead_keysym = dead_state_keysym(
+            dead_state.terminator, dead_state.compositions)
         if dead_keysym is None and dead_state.terminator:
             escaped_term = _escape_result(dead_state.terminator)
             lines.append('<%s>\t: "%s"\t# %s'
@@ -112,22 +213,8 @@ def emit_compose(layout: Layout, header_note: str = '') -> str:
                             _codepoint_comment(dead_state.terminator)))
             total += 1
 
-        for base_char, result in sorted(dead_state.compositions.items()):
-            if not base_char:
-                continue
-
-            base_keysym = char_to_keysym(base_char)
-            if base_keysym is None:
-                warn('compose',
-                     f'composition base {base_char!r} in state {state_name!r} '
-                     f'has no single keysym; skipping that entry')
-                continue
-
-            escaped = _escape_result(result)
-            comment = _codepoint_comment(result)
-            lines.append('<%s> <%s>\t: "%s"\t# %s'
-                         % (trigger, base_keysym, escaped, comment))
-            total += 1
+        total += _emit_state_lines(
+            layout, placeholders, dead_state, (trigger,), {state_name}, lines)
 
         lines.append('')
 

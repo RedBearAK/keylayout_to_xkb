@@ -40,7 +40,7 @@ import enum
 from dataclasses import dataclass, field
 
 
-__version__ = '20260703'
+__version__ = '20260703b'
 
 
 class ModifierState(enum.Enum):
@@ -196,15 +196,27 @@ class DeadState:
     string. Example for an acute state: {'e': 'e-acute', 'a': 'a-acute'}. The
     result MAY be multi-codepoint (same contract as KeyOutput.output).
 
-    CHAINED DEAD KEYS ARE FLATTENED HERE ON PURPOSE. Some layouts (Greek
-    Polytonic) build a result through several dead keys in sequence
-    (breathing + accent). Both the 'uchr' parser and the XML parser resolve
-    those chains down to direct base->result entries in 'compositions'. There is
-    deliberately NO separate chaining graph on this model: it was tried, never
-    populated, and removed, because flattening produces correct output and a
-    second representation only invites the two to disagree. If you think you
-    need chaining state here, first confirm the parser is not already flattening
-    it (it is) before adding a field the emitter would also have to learn.
+    CHAINED DEAD KEYS live in the four graph fields below. A historical note
+    explains their shape: an earlier chaining graph 'was tried, never
+    populated, and removed' -- because the format-2 record grammar was
+    misdecoded at the time, so chain entries were structurally invisible.
+    The proven grammar (see uchr_parse._parse_range_record_entries) exposes
+    them: Tibetan Wylie alone carries 54 transitions and 445 in-state outputs
+    triggered by dead keys, reaching stacking depth 4. In-state behavior is
+    keyed by WHAT WAS PRESSED: a literal-char key (keyed by its ground char,
+    same keying as 'compositions') or a dead key (keyed by the GROUND STATE
+    NAME that key enters from ground, which is also how the compose emitter
+    derives its keysym).
+
+      'compositions'      char pressed in this state  -> result string
+      'dead_compositions' dead key pressed here       -> result string
+                          (key: the pressed key's ground state name)
+      'char_transitions'  char pressed in this state  -> deeper state name
+      'dead_transitions'  dead key pressed here       -> deeper state name
+
+    'ground' is True for states enterable directly from ground (a key cell
+    references them); deeper chain-target states are created with False and
+    are reachable only through paths, never emitted as level-1 dead keys.
 
     'xkb_keysym' is filled by the classify stage: the XKB dead_* keysym whose
     diacritic matches this state's terminator/compositions. None until then.
@@ -213,6 +225,10 @@ class DeadState:
     name:               str
     terminator:         str = ''
     compositions:       'dict[str, str]' = field(default_factory=dict)
+    dead_compositions:  'dict[str, str]' = field(default_factory=dict)
+    char_transitions:   'dict[str, str]' = field(default_factory=dict)
+    dead_transitions:   'dict[str, str]' = field(default_factory=dict)
+    ground:             bool = True
     xkb_keysym:         'str | None' = None     # filled in by classify stage
 
 
