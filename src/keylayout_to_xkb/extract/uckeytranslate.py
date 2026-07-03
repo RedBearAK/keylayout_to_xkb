@@ -45,7 +45,7 @@ from keylayout_to_xkb.common.models import (
 )
 
 
-__version__ = '20260702'
+__version__ = '20260703'
 
 
 def _utf16_units_to_str(out_buffer, length: int) -> str:
@@ -184,6 +184,8 @@ def resolve_plane_tables_via_os(
     data: bytes,
     char_tables: 'list[tuple[int, int]]',
     table_outputs_fn,
+    table_cells_fn=None,
+    ondisk_tables=None,
 ) -> 'dict | None':
     """Authoritatively resolve plane -> table index using UCKeyTranslate.
 
@@ -196,8 +198,15 @@ def resolve_plane_tables_via_os(
     silently drop the Option layers (the bug the OS oracle caught on first run).
 
     Method: for each plane, ask UCKeyTranslate what the probe keys produce, then
-    find the table whose probe-key outputs match best. Requiring several probe
-    keys to agree makes the match unambiguous.
+    find the table whose probe-key outputs match best. When several NON-identical
+    tables tie on the probe keys (near-twin table families differing only in
+    dead keys or characters outside the probe set -- the mechanism behind every
+    historical OS-vs-content disagreement), the tie is settled by asking the OS
+    about EXACTLY the cells where the candidates differ, dead-state included,
+    via 'table_cells_fn' (table_index -> {vk: (kind, output)} with kind 'char'
+    or 'dead'). A tie that survives even that means the tool's decision rule is
+    not understood: warn loudly and fall back to 'ondisk_tables' (the
+    byte-indexed modifier-map pick, the best-validated secondary) when given.
     """
 
     try:
@@ -233,21 +242,28 @@ def resolve_plane_tables_via_os(
             dbg('uckt', f'plane {plane.value}: no probe output; skipping')
             continue
 
-        best_index = None
-        best_score = 0
+        scores = {}
         for table_index, probe in table_probe.items():
             shared = [vk for vk in os_outputs if vk in probe]
             if not shared:
                 continue
-            agree = sum(1 for vk in shared if probe[vk] == os_outputs[vk])
-            # Require strong agreement; track the best-matching table.
-            if agree > best_score:
-                best_score = agree
-                best_index = table_index
+            scores[table_index] = sum(
+                1 for vk in shared if probe[vk] == os_outputs[vk])
+
+        best_score = max(scores.values()) if scores else 0
+        candidates = sorted(
+            table_index for table_index, score in scores.items()
+            if score == best_score)
 
         # Only accept a confident match (most probe keys agree).
-        if best_index is not None and best_score >= max(2, len(os_outputs) - 1):
-            resolved[plane] = best_index
+        if candidates and best_score >= max(2, len(os_outputs) - 1):
+            if len(candidates) == 1:
+                resolved[plane] = candidates[0]
+            else:
+                resolved[plane] = _settle_table_tie(
+                    plane, candidates, modifier_byte, handle, layout_ptr,
+                    kbd_type, table_outputs_fn, table_cells_fn, ondisk_tables,
+                )
         else:
             dbg(
                 'uckt',
@@ -283,6 +299,78 @@ def resolve_plane_tables_via_os(
 # number row, punctuation, and the ISO/JIS extra keys, i.e. every key a layout
 # meaningfully maps. Function/arrow/keypad keys are excluded (not layout chars).
 _REFERENCE_VKS = tuple(range(0, 0x35)) + (0x52, 0x5d, 0x5e)
+
+
+def _settle_table_tie(plane, candidates, modifier_byte, handle, layout_ptr,
+                      kbd_type, table_outputs_fn, table_cells_fn,
+                      ondisk_tables):
+    """Settle a probe-key tie among candidate tables for one plane.
+
+    Content-identical duplicates are a legitimate tie: pick the lowest index
+    silently. NON-identical candidates get discriminated by asking the OS
+    about exactly the cells where they differ (dead-state aware). A tie that
+    survives that means the tool's decision rule is not understood: warn
+    loudly and fall back to the on-disk pick when available.
+    """
+
+    # Cells per candidate: {vk: (kind, output)} with dead cells visible. Fall
+    # back to outputs-only comparison when no cells callback was provided.
+    if table_cells_fn is not None:
+        cells = {index: table_cells_fn(index) for index in candidates}
+    else:
+        cells = {
+            index: {vk: ('char', out)
+                    for vk, out in table_outputs_fn(index).items()}
+            for index in candidates
+        }
+
+    signatures = {index: tuple(sorted(cells[index].items()))
+                  for index in candidates}
+    if len(set(signatures.values())) == 1:
+        # True duplicates: identical content at every cell, index is cosmetic.
+        return candidates[0]
+
+    differing = sorted({
+        vk
+        for a in candidates for b in candidates if a < b
+        for vk in set(cells[a]) | set(cells[b])
+        if cells[a].get(vk) != cells[b].get(vk)
+    })
+
+    tallies = {index: 0 for index in candidates}
+    for vk in differing[:24]:
+        os_output, dead_state = _translate_full(
+            handle, layout_ptr, kbd_type, vk, modifier_byte)
+        for index in candidates:
+            cell = cells[index].get(vk)
+            if dead_state:
+                agrees = cell is not None and cell[0] == 'dead'
+            elif os_output:
+                agrees = (cell is not None and cell[0] == 'char'
+                          and cell[1] == os_output)
+            else:
+                agrees = cell is None
+            if agrees:
+                tallies[index] += 1
+
+    best_tally = max(tallies.values())
+    winners = sorted(index for index, tally in tallies.items()
+                     if tally == best_tally)
+    if len(winners) == 1:
+        dbg('uckt', f'plane {plane.value}: tie among tables '
+            f'{candidates} settled at differing cells -> {winners[0]}')
+        return winners[0]
+
+    fallback = None
+    if ondisk_tables is not None:
+        fallback = ondisk_tables.get(plane)
+    if fallback is None:
+        fallback = winners[0]
+    warn('uckt', f'plane {plane.value}: {len(winners)} NON-identical tables '
+         f'{winners} still tie after probing their differing cells; the '
+         f'native decision rule is not understood here. Using table '
+         f'{fallback} (on-disk pick when available).')
+    return fallback
 
 
 class OSOracleUnavailable(Exception):

@@ -40,7 +40,7 @@ import enum
 from dataclasses import dataclass, field
 
 
-__version__ = '20260702'
+__version__ = '20260703'
 
 
 class ModifierState(enum.Enum):
@@ -89,8 +89,9 @@ class ModifierState(enum.Enum):
 # Carbon modifier bytes for UCKeyTranslate, one per typeable plane: the
 # modifierKeyState parameter is (EventRecord modifiers >> 8), so
 # shiftKey=0x0200 -> 0x02, alphaLock=0x0400 -> 0x04, optionKey=0x0800 -> 0x08,
-# composed bitwise for the combination planes. The same bytes, +2, index the
-# on-disk keyModifiersToTableNum array (see uchr_parse._resolve_plane_tables).
+# composed bitwise for the combination planes. The same bytes DIRECTLY index
+# the on-disk keyModifiersToTableNum array (entries at struct offset +8; see
+# uchr_parse._parse_modifier_table_map for the alignment history).
 #
 # This dict is THE single source of truth for plane -> modifier byte. The OS
 # plane resolver (extract/uckeytranslate.resolve_plane_tables_via_os), the OS

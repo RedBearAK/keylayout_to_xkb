@@ -72,7 +72,7 @@ from keylayout_to_xkb.common.models import (
 )
 
 
-__version__ = '20260702'
+__version__ = '20260703'
 
 
 # Caps-layer planes: human label -> modifier byte, derived from the SHARED
@@ -106,7 +106,7 @@ def _prep(data):
 
 
 def _our_cell(p, byte, vk):
-    idx = byte + 2
+    idx = byte        # direct index: the map decode is struct-aligned now
     ti = p['arr'][idx] if idx < len(p['arr']) else p['default']
     if ti >= p['ccount'] or vk >= p['csize']:
         return ('NONE', None)

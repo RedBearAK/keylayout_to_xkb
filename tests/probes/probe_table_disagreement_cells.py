@@ -63,7 +63,7 @@ from keylayout_to_xkb.extract.uckeytranslate import (
 )
 
 
-__version__ = '20260703'
+__version__ = '20260703b'
 
 
 def _pieces(data):
@@ -87,7 +87,7 @@ def _pieces(data):
 def _ondisk_table(table_map, default_table, table_count, modifier_byte):
     """The byte-indexed on-disk pick, mirroring the content resolver."""
 
-    index = modifier_byte + 2       # the parser's compensated indexing
+    index = modifier_byte           # direct: the map decode is struct-aligned
     if 0 <= index < len(table_map):
         table_index = table_map[index]
     else:

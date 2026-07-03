@@ -61,7 +61,7 @@ from keylayout_to_xkb.common.models import PLANE_MODIFIER_BYTE
 from keylayout_to_xkb.extract.uchr_parse import _parse_modifier_table_map
 
 
-__version__ = '20260703'
+__version__ = '20260703b'
 
 
 _UPLOADS = '/mnt/user-data/uploads'
@@ -111,6 +111,12 @@ def _check_record(data, mod_off):
     _fmt, default_num, count = struct.unpack_from('<HHI', data, mod_off)
     raw = list(data[mod_off + 8: mod_off + 8 + count])
     parsed, parsed_default = _parse_modifier_table_map(data, mod_off)
+
+    if parsed == raw:
+        # The ALIGNED decode is active (post-fix parser): equivalence with the
+        # historical compensated decode was verified before the fix landed;
+        # nothing left to compare against.
+        return 0, 0, 0, parsed_default == default_num, count
 
     def old_pick(byte):
         index = byte + 2

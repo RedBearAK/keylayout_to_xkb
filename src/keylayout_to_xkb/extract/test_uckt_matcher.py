@@ -33,16 +33,17 @@ from keylayout_to_xkb.extract import uchr_parse
 from keylayout_to_xkb.extract import uckeytranslate
 
 
-__version__ = '20260702'
+__version__ = '20260703'
 
 
 _FIXTURE = '/mnt/user-data/uploads/com_apple_keylayout_PolishPro.uchr'
+_LATVIAN_FIXTURE = '/mnt/user-data/uploads/com_apple_keylayout_Latvian.uchr'
 
 _ACID_VK = 0x0F         # the r key
 _ACID_CHAR = 'Ś'        # PolishPro caps+option on r
 
 
-def _load_fixture_pieces():
+def _load_fixture_pieces(fixture_path=_FIXTURE):
     """Parse the fixture's raw pieces the matcher needs, via uchr_parse.
 
     Returns (data, char_tables, table_map, default_table, table_outputs_fn) or
@@ -51,9 +52,9 @@ def _load_fixture_pieces():
     and sequence offsets, plus the modifier-map offset.
     """
 
-    if not os.path.isfile(_FIXTURE):
+    if not os.path.isfile(fixture_path):
         return None
-    with open(_FIXTURE, 'rb') as handle:
+    with open(fixture_path, 'rb') as handle:
         data = handle.read()
 
     (_first, _last, mod_offset, char_index_offset,
@@ -99,7 +100,7 @@ def _run_matcher_with_fake_os(pieces):
 
     def fake_translate(_handle, _layout_ptr, _kbd_type, virtual_key,
                        modifier_byte):
-        index = modifier_byte + 2
+        index = modifier_byte
         if 0 <= index < len(table_map):
             table_index = table_map[index]
         else:
@@ -108,17 +109,48 @@ def _run_matcher_with_fake_os(pieces):
             return None
         return _outputs_for(table_index).get(virtual_key)
 
+    cells_cache = {}
+
+    def _cells_for(table_index):
+        if table_index not in cells_cache:
+            cells_cache[table_index] = uchr_parse._table_cells(
+                data, char_tables[table_index], state_records, sequences,
+            )
+        return cells_cache[table_index]
+
+    def fake_translate_full(_handle, _layout_ptr, _kbd_type, virtual_key,
+                            modifier_byte):
+        index = modifier_byte
+        if 0 <= index < len(table_map):
+            table_index = table_map[index]
+        else:
+            table_index = default_table
+        if not (0 <= table_index < len(char_tables)):
+            return '', 0
+        cell = _cells_for(table_index).get(virtual_key)
+        if cell is None:
+            return '', 0
+        kind, output = cell
+        if kind == 'dead':
+            return '', 1
+        return output, 0
+
     orig_load = uckeytranslate._load_uckeytranslate
     orig_translate = uckeytranslate._translate
+    orig_translate_full = uckeytranslate._translate_full
     uckeytranslate._load_uckeytranslate = fake_load
     uckeytranslate._translate = fake_translate
+    uckeytranslate._translate_full = fake_translate_full
     try:
         resolved = uckeytranslate.resolve_plane_tables_via_os(
             data, char_tables, table_outputs_fn,
+            table_cells_fn=_cells_for,
+            ondisk_tables=None,
         )
     finally:
         uckeytranslate._load_uckeytranslate = orig_load
         uckeytranslate._translate = orig_translate
+        uckeytranslate._translate_full = orig_translate_full
 
     content = uchr_parse._resolve_plane_tables(
         data, char_tables, table_map, default_table,
@@ -197,6 +229,34 @@ def test_caps_acid_cell():
     return True
 
 
+def test_near_twin_discrimination():
+    """The Latvian near-twin case: fake-OS resolution must pick table 8.
+
+    Latvian's plain plane is the historical worst case: tables 0 and 8 agree
+    on 106 of 109 cells and every discriminating cell (dead accents) lies
+    outside the fixed probe set, so the blind matcher tied and took table 0
+    while the on-disk map (verified against the native tool at every
+    disagreement cell) says table 8. The sighted matcher must settle the tie
+    at the differing cells and land on 8.
+    """
+
+    pieces = _load_fixture_pieces(_LATVIAN_FIXTURE)
+    if pieces is None:
+        print('  skipped (Latvian fixture missing)')
+        return True
+    resolved, _content = _run_matcher_with_fake_os(pieces)
+    if not resolved or ModifierState.PLAIN not in resolved:
+        print('  plain plane not resolved')
+        return False
+    picked = resolved[ModifierState.PLAIN]
+    if picked != 8:
+        print('  plain resolved to table %d, want 8 (the on-disk twin)'
+              % picked)
+        return False
+    print('  near-twin tie settled at differing cells: plain -> table 8')
+    return True
+
+
 def main():
     print('uckt matcher tests:\n')
     tests = (
@@ -204,6 +264,7 @@ def main():
         ('output-equivalent to content resolver',
          test_output_equivalent_to_content_resolver),
         ('caps acid cell (Sacute)', test_caps_acid_cell),
+        ('near-twin discrimination (Latvian)', test_near_twin_discrimination),
     )
     score = 0
     for label, test_fn in tests:

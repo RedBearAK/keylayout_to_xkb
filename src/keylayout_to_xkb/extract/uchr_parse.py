@@ -33,7 +33,7 @@ from keylayout_to_xkb.common.gestalt_keyboard import (
 )
 
 
-__version__ = '20260702b'
+__version__ = '20260703'
 
 
 _EXPECTED_HEADER_FORMAT     = 0x1002
@@ -328,10 +328,26 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '',
             data, char_tables[table_index], state_records, sequences,
         )
 
+    def table_cells_for(table_index):
+        return _table_cells(
+            data, char_tables[table_index], state_records, sequences,
+        )
+
+    # The on-disk resolution comes FIRST: it is cheap, fully validated against
+    # the native tool (all 241 layouts, every historical disagreement cell),
+    # and doubles as the tie-breaking hint and the cross-check baseline for
+    # the OS path below.
+    content_tables = _resolve_plane_tables(
+        data, char_tables, table_map, default_table,
+        state_records, sequences,
+    )
+
     plane_tables = None
     try:
         plane_tables = resolve_plane_tables_via_os(
-            data, char_tables, table_outputs_for
+            data, char_tables, table_outputs_for,
+            table_cells_fn=table_cells_for,
+            ondisk_tables=content_tables,
         )
     except Exception as os_error:                       # never let OS path abort
         warn('uchr', f'{layout_name!r}: UCKeyTranslate path errored '
@@ -340,10 +356,6 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '',
 
     if plane_tables:
         dbg('uchr', 'plane resolution: UCKeyTranslate (deterministic)')
-        content_tables = _resolve_plane_tables(
-            data, char_tables, table_map, default_table,
-            state_records, sequences,
-        )
         missing = [
             plane for plane in content_tables if plane not in plane_tables
         ]
@@ -373,10 +385,7 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '',
                     f'content; keeping the OS result'
                 )
     else:
-        plane_tables = _resolve_plane_tables(
-            data, char_tables, table_map, default_table,
-            state_records, sequences,
-        )
+        plane_tables = content_tables
         dbg('uchr', 'plane resolution: content-driven (fallback)')
     dbg(
         'uchr',
@@ -529,19 +538,27 @@ def _parse_modifier_table_map(data: bytes, offset: int) -> 'tuple[list[int], int
     Structure at offset:
       u16 marker            (== 0x3001)
       u16 defaultTableNum
-      u16 modifiersCount
+      u32 modifiersCount
       u8  tableNum[modifiersCount]
 
     The array index is a macOS modifierKeyState value; the byte at that index is
     the char-table number to use for that modifier combination. An out-of-range
     plane query falls back to defaultTableNum.
+
+    ALIGNMENT NOTE: modifiersCount is a UInt32 and the tableNum array starts at
+    offset+8. An earlier decode read the count as u16 and the entries at
+    offset+6, swallowing the count's high half as two phantom zero entries --
+    which a '+2' compensation in the plane indexing exactly canceled, hiding
+    the misread until the near-twin-table investigation. Equivalence of the
+    aligned decode was verified byte-for-byte across all 241 Mac layouts
+    (1401 keyboard-type records, zero mismatches) before this fix landed.
     """
 
     if offset == 0:
         return [], 0
 
-    _check_bounds(data, offset, 6, 'modifier-table-map header')
-    marker, default_table, modifiers_count = struct.unpack_from('<HHH', data, offset)
+    _check_bounds(data, offset, 8, 'modifier-table-map header')
+    marker, default_table, modifiers_count = struct.unpack_from('<HHI', data, offset)
 
     if marker != _MOD_MAP_MARKER:
         warn(
@@ -555,10 +572,43 @@ def _parse_modifier_table_map(data: bytes, offset: int) -> 'tuple[list[int], int
         warn('uchr', f'implausible modifiersCount={modifiers_count}; ignoring map')
         return [], 0
 
-    _check_bounds(data, offset + 6, modifiers_count, 'modifier-table-map array')
-    table_nums = [data[offset + 6 + i] for i in range(modifiers_count)]
+    _check_bounds(data, offset + 8, modifiers_count, 'modifier-table-map array')
+    table_nums = [data[offset + 8 + i] for i in range(modifiers_count)]
 
     return table_nums, default_table
+
+
+def _table_cells(
+    data: bytes,
+    table: 'tuple[int, int]',
+    state_records: 'list[dict]',
+    sequences: 'list[str]',
+) -> 'dict':
+    """Return {virtual_key: (kind, output)} for a table, DEAD CELLS INCLUDED.
+
+    kind is 'char' (single-character literal output) or 'dead' (the cell
+    enters a dead-key state; output is ''). Cells with no output and
+    multi-char cells are omitted. This is the discrimination-oriented sibling
+    of _table_outputs: the OS plane matcher settles near-twin table ties by
+    comparing UCKeyTranslate answers (dead-state aware) against these cells,
+    so dead keys MUST be visible here -- hiding them is exactly how near-twin
+    tables became indistinguishable to the matcher.
+    """
+
+    table_offset, table_size = table
+    cells = {}
+    for virtual_key in range(table_size):
+        entry = struct.unpack_from('<H', data, table_offset + 2 * virtual_key)[0]
+        ko = _entry_to_key_output(
+            entry, state_records, sequences, virtual_key,
+        )
+        if ko is None:
+            continue
+        if ko.kind is OutputKind.DEAD:
+            cells[virtual_key] = ('dead', '')
+        elif ko.kind is OutputKind.CHARS and ko.output and len(ko.output) == 1:
+            cells[virtual_key] = ('char', ko.output)
+    return cells
 
 
 def _table_outputs(
@@ -655,13 +705,12 @@ def _resolve_plane_tables(
             if 0 <= ti < table_count
         }
 
-    # plane -> (modifier byte + 2) index into keyModifiersToTableNum. The
-    # bytes come from the SHARED PLANE_MODIFIER_BYTE constant (models.py), the
-    # same one the UCKeyTranslate resolver and the verify audit use, so the
-    # on-disk and OS-oracle plane sets can never drift apart again.
-    plane_index = {
-        plane: byte + 2 for plane, byte in PLANE_MODIFIER_BYTE.items()
-    }
+    # The modifier byte indexes keyModifiersToTableNum DIRECTLY now that the
+    # map decode is struct-aligned (see _parse_modifier_table_map). The bytes
+    # come from the SHARED PLANE_MODIFIER_BYTE constant (models.py), the same
+    # one the UCKeyTranslate resolver and the verify audit use, so the on-disk
+    # and OS-oracle plane sets can never drift apart again.
+    plane_index = dict(PLANE_MODIFIER_BYTE)
 
     resolved = {}
     for plane, index in plane_index.items():
