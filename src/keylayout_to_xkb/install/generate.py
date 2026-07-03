@@ -25,7 +25,7 @@ from keylayout_to_xkb.common.debug import warn
 from keylayout_to_xkb.install.catalog import LayoutRecord
 
 
-__version__ = '20260703b'
+__version__ = '20260703c'
 
 
 def _record_to_dict(record: LayoutRecord) -> 'dict':
@@ -144,7 +144,10 @@ Usage:
   python3 THIS_FILE.py --list          list embedded layouts
   python3 THIS_FILE.py --install ID    install one layout by identifier
   python3 THIS_FILE.py --install-lang L install all layouts in a language group
-  python3 THIS_FILE.py --install-all   install every embedded layout
+  python3 THIS_FILE.py --install-all   install every embedded layout (user)
+  python3 THIS_FILE.py --install-all-system  install every layout, symbols in
+                                       the system location (keyboard preview
+                                       works; uses sudo/doas/run0 as needed)
   python3 THIS_FILE.py --dump DIR      write the raw XKB/Compose files to DIR
   python3 THIS_FILE.py --force ...     rewrite even if unchanged
   python3 THIS_FILE.py --preview ID    print a layout's structured summary
@@ -154,7 +157,10 @@ import os
 import sys
 import json
 import pydoc
+import shutil
 import hashlib
+import tempfile
+import subprocess
 
 from xml.sax.saxutils import escape as _xml_escape
 
@@ -250,42 +256,81 @@ def _require_linux():
         sys.exit(2)
 
 
-def _refuse_root():
-    """Refuse to run as root (absolute, no override).
+_SYSTEM_VERBS = ('--system-apply', '--system-remove')
 
-    The installer targets your personal ~/.config/xkb. Running as root would
-    write root-owned files into the wrong home directory and would not install
-    the layout for your normal user. There is intentionally no --allow-root: if
-    you want the files in a system location, use --dump and place them by hand.
+
+def _refuse_root():
+    """Refuse to run as root, except for the two narrow system verbs.
+
+    Everything except --system-apply/--system-remove targets your personal
+    ~/.config/xkb: running THAT as root would write root-owned files into the
+    wrong home and install nothing for your normal user. The system verbs are
+    the ONLY root-legitimate operations (they copy pre-staged, marker-verified
+    symbols files into /usr/share/X11/xkb/symbols); the interactive menu and
+    --install-all-system invoke them through sudo/doas/run0/sudo-rs for you,
+    so there is still no reason to launch this installer with sudo yourself.
     Catches plain root, sudo, and a setuid-root binary alike (all give euid 0).
     """
 
     if hasattr(os, 'geteuid') and os.geteuid() == 0:
         sys.stderr.write(
-            'Refusing to run as root. This installer writes to your personal '
-            '~/.config/xkb and must run as your normal user.\n')
+            'Refusing to run as root. This installer runs as your normal '
+            'user and escalates by itself\n'
+            'for the system-location step (the menu and '
+            '--install-all-system handle it).\n')
         sudo_user = os.environ.get('SUDO_USER')
         if sudo_user:
             sys.stderr.write(
                 'It looks like you used sudo -- run it directly as %s '
                 '(no sudo).\n' % sudo_user)
+        sys.exit(2)
+
+
+def _require_root(verb):
+    """The system verbs write to /usr and MUST run as root."""
+
+    if not hasattr(os, 'geteuid') or os.geteuid() != 0:
         sys.stderr.write(
-            'To install into a system location instead, use --dump DIR and '
-            'place the files by hand.\n')
+            '%s writes to the system XKB tree and must run as root.\n'
+            'Use the interactive menu or --install-all-system, which '
+            'escalate for you.\n' % verb)
         sys.exit(2)
 
 
 def main(argv):
     _require_linux()
-    _refuse_root()
 
     force = '--force' in argv
     argv = [a for a in argv if a != '--force']
+    cmd = argv[0] if argv else ''
+
+    # The two root-only verbs dispatch BEFORE the root refusal; everything
+    # else keeps the absolute refusal.
+    if cmd == '--system-apply' and len(argv) > 1:
+        _require_root(cmd)
+        result = system_apply(argv[1])
+        for name in result['written']:
+            print('system: wrote symbols/%s' % name)
+        for line in result['refused']:
+            print('system: REFUSED %s' % line)
+        if result['error']:
+            print('system: FAILED and rolled back: %s' % result['error'])
+            return 1
+        return 0 if not result['refused'] else 1
+    if cmd == '--system-remove':
+        _require_root(cmd)
+        result = system_remove()
+        for name in result['removed']:
+            print('system: removed symbols/%s' % name)
+        for line in result['skipped']:
+            print('system: skipped %s' % line)
+        return 0
+
+    _refuse_root()
 
     if not argv:
         return _menu(force=force)
 
-    cmd = argv[0]
     if cmd == '--list':
         _print_list(); return 0
     if cmd == '--preview' and len(argv) > 1:
@@ -302,6 +347,8 @@ def main(argv):
         _report(install_records(records, force=force)); return 0
     if cmd == '--install-all':
         _report(install_records(list(RECORDS), force=force)); return 0
+    if cmd == '--install-all-system':
+        return _system_install_records(list(RECORDS), force=force)
     if cmd == '--dump' and len(argv) > 1:
         written = dump_records(list(RECORDS), argv[1])
         print('Wrote %d files to %s' % (len(written), argv[1])); return 0
@@ -508,8 +555,98 @@ def _select_records():
         _pause()
 
 
+def _escalate_run(extra_args):
+    """Run this installer with 'extra_args' through the first available
+    privilege-escalation tool (Toshy convention: sudo, doas, run0, sudo-rs).
+
+    Runs interactively so the tool can prompt for a password on the user's
+    terminal. Returns the child's exit code, or None when no escalation tool
+    exists -- in which case the exact command is printed for manual use, so
+    the user is never stuck.
+    """
+
+    script = os.path.abspath(__file__)
+    command_tail = [sys.executable, script] + list(extra_args)
+    for tool in ('sudo', 'doas', 'run0', 'sudo-rs'):
+        if shutil.which(tool):
+            print('Escalating with %s for the system-location step...' % tool)
+            return subprocess.call([tool] + command_tail)
+    print('No escalation tool found (looked for sudo, doas, run0, sudo-rs).')
+    print('Run this yourself as root, then re-run the installer:')
+    print('  ' + ' '.join(command_tail))
+    return None
+
+
+def _system_install_records(records, force=False):
+    """The system-mode install: validate as the user, escalate for symbols,
+    then finish the user-side files.
+
+    Sequence: (1) decline early on read-only /usr (immutable distros);
+    (2) build and VALIDATE the complete tree in a throwaway user-style root,
+    so nothing broken is ever staged; (3) stage the symbols files and
+    escalate for --system-apply; (4) on success, write the user-side pieces
+    (rules/registry/compose) WITHOUT symbols -- which also removes any stale
+    user-dir symbols files, since a user copy would shadow the system one --
+    and validate the final assembly, which now resolves against the system
+    files.
+    """
+
+    if not system_symbols_writable():
+        print('The system XKB location is on a read-only filesystem')
+        print('(immutable distro?). System mode is not possible here;')
+        print('use the user-location install instead (keyboard preview')
+        print('will not work there).')
+        return 1
+
+    check_root = tempfile.mkdtemp(prefix='kl2xkb-precheck-')
+    try:
+        report = install_records(records, paths=InstallPaths(root=check_root),
+                                 force=True)
+        if report.get('validation') == 'failed':
+            print('Pre-validation FAILED; nothing was installed anywhere:')
+            _report(report)
+            return 1
+    finally:
+        shutil.rmtree(check_root, ignore_errors=True)
+
+    staged = tempfile.mkdtemp(prefix='kl2xkb-stage-')
+    keep_staged = False
+    try:
+        names = stage_system_symbols(records, staged)
+        print('Staged %d symbols file(s): %s' % (len(names), ', '.join(names)))
+        code = _escalate_run(['--system-apply', staged])
+        if code is None:
+            # The printed manual command references the staged dir: keep it,
+            # or the instructions would point at a deleted path.
+            keep_staged = True
+            print('(The staged files are kept at %s until you do.)' % staged)
+            return 1
+        if code != 0:
+            print('System apply did not complete (exit %d); the user-side'
+                  % code)
+            print('files were left untouched.')
+            return code
+
+        report = install_records(records, force=force, write_symbols=False)
+        _report(report)
+        print('')
+        print('Symbols are in the system location: the keyboard preview and')
+        print('Xorg sessions can use these layouts. Uninstalling later needs')
+        print('the same escalation (the Manage menu handles it).')
+        return 0
+    finally:
+        if not keep_staged:
+            shutil.rmtree(staged, ignore_errors=True)
+
+
 def _confirm_and_install(records, force=False):
-    """Show the selection, confirm, then install via the real machinery."""
+    """Show the selection, ask the destination, confirm, then install.
+
+    System mode (symbols in /usr/share/X11/xkb/symbols) is the primary path:
+    it is the only placement the X server's own compiler sees, which is what
+    makes the KDE keyboard preview and pure Xorg sessions work. User mode
+    stays available for machines without escalation or with read-only /usr.
+    """
 
     if not records:
         return
@@ -520,14 +657,25 @@ def _confirm_and_install(records, force=False):
         variants = ', '.join(v[0] for v in record['variants'])
         print('  %s)  [%s]' % (record['display_name'], variants))
     print('')
-    print('Files go under %s' % user_xkb_root())
-    answer = _ask('\nProceed? [y/N] ')
-    if answer.lower() not in ('y', 'yes'):
+    print('Where should the layouts be installed?')
+    print('  1) System location (recommended -- keyboard preview works;')
+    print('     needs admin rights for one step) [default]')
+    print('  2) User location only (no admin rights, but the keyboard')
+    print('     preview will NOT work)')
+    print('  blank) Cancel')
+    answer = _ask('\nChoice [1]: ').strip().lower()
+    if answer in ('', '1', 'system', 's'):
+        _clear()
+        _system_install_records(records, force=force)
+        _pause()
+        return
+    if answer not in ('2', 'user', 'u'):
         _clear()
         print('Cancelled. Nothing was installed.')
         _pause()
         return
     _clear()
+    print('Installing to the user location (keyboard preview will not work).')
     report = install_records(records, force=force)
     _report(report)
     _pause()
@@ -634,10 +782,11 @@ def _manage_flow(force=False):
     """Show installed layouts and offer to uninstall one or all."""
 
     installed = list_installed()
+    system_files = system_installed()
     _clear()
     print('Manage installed layouts')
     print('=' * 40)
-    if not installed:
+    if not installed and not system_files:
         print('Nothing is installed.')
         _pause()
         return
@@ -645,12 +794,33 @@ def _manage_flow(force=False):
     for index, record in enumerate(ordered, start=1):
         print('  %2d) %-18s %s)'
               % (index, record['identifier'], record['display_name']))
+    if system_files:
+        print('')
+        print('System-location symbols files (need admin rights to remove):')
+        for name, present in system_files:
+            print('     symbols/%s%s' % (name, '' if present else ' (missing)'))
     print('')
     print('Enter a number to uninstall that layout, "all" to remove every')
-    print('kl2xkb layout, or blank to go back.')
+    if system_files:
+        print('kl2xkb layout, "sys" to remove the system-location symbols')
+        print('files (escalates), or blank to go back.')
+    else:
+        print('kl2xkb layout, or blank to go back.')
     answer = _ask('> ').strip().lower()
 
     if not answer:
+        return
+    if answer == 'sys' and system_files:
+        confirm = _ask('Remove %d system symbols file(s)? [y/N] '
+                       % len(system_files))
+        if confirm.lower() in ('y', 'yes'):
+            code = _escalate_run(['--system-remove'])
+            _clear()
+            if code == 0:
+                print('System-location symbols removed.')
+            else:
+                print('System removal did not complete.')
+            _pause()
         return
     if answer == 'all':
         confirm = _ask('Remove ALL %d installed layout(s)? [y/N] ' % len(ordered))

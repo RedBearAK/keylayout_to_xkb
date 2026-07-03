@@ -23,7 +23,7 @@ import json
 from xml.sax.saxutils import escape as _xml_escape
 
 
-__version__ = '20260701'
+__version__ = '20260703'
 
 
 _NAMESPACE = 'keylayout_to_xkb'
@@ -301,7 +301,7 @@ def _load_manifest(paths):
         return {'installed': {}}
 
 
-def _rebuild_managed_files(paths, manifest, force):
+def _rebuild_managed_files(paths, manifest, force, write_symbols=True):
     """Write the four kl2xkb-managed files from the manifest's current record set
     (or remove a file when nothing remains needs it).
 
@@ -347,7 +347,13 @@ def _rebuild_managed_files(paths, manifest, force):
 
     # Write one symbols file per base layout; track which we wrote so we can
     # remove any leftover '<base>-k2x' file from a previous install.
-    symbols_by_base = build_symbols_files(merged)
+    #
+    # SYSTEM-MODE NOTE: with write_symbols=False (symbols living in the
+    # system location instead), the desired set is empty, so the leftover
+    # loop below removes EVERY marked user-side symbols file -- which is
+    # exactly the migration a user-mode -> system-mode switch needs, since a
+    # user-dir copy would shadow the system one in the compositor's search.
+    symbols_by_base = build_symbols_files(merged) if write_symbols else {}
     written_symbol_paths = set()
     for base, content in symbols_by_base.items():
         path = paths.symbols_file_for(base)
@@ -484,7 +490,8 @@ def _restore_files(snapshot):
                 handle.write(content)
 
 
-def install_records(new_records, paths=None, force=False, validate=True):
+def install_records(new_records, paths=None, force=False, validate=True,
+                    write_symbols=True):
     """Install records, then validate the assembled keymap and ROLL BACK on
     failure so a broken layout never reaches the live XKB tree.
 
@@ -506,7 +513,8 @@ def install_records(new_records, paths=None, force=False, validate=True):
         (refreshed if ident in manifest['installed'] else added).append(ident)
         manifest['installed'][ident] = record
 
-    status, merged = _rebuild_managed_files(paths, manifest, force)
+    status, merged = _rebuild_managed_files(paths, manifest, force,
+                           write_symbols=write_symbols)
 
     result = {'paths': paths, 'status': status, 'added': added,
               'refreshed': refreshed,
@@ -589,6 +597,179 @@ def uninstall_all(paths=None):
             except OSError:
                 pass
     return {'paths': paths, 'removed': removed}
+
+
+# --- system-location install (symbols only) --------------------------------
+#
+# System mode moves ONLY the per-base symbols files to the system XKB tree:
+# that placement is what the X server's own compiler (and therefore the KDE
+# keyboard preview and pure Xorg sessions) can see. Rules/registry overlays
+# stay user-side in both modes (libxkbregistry reads XDG paths -- that is
+# what makes desktop pickers work), and XCompose is per-user by nature.
+# These functions are policy-free engine pieces: root checks, escalation, and
+# UI live in the generated installer.
+
+SYSTEM_SYMBOLS_DIR = '/usr/share/X11/xkb/symbols'
+SYSTEM_MANIFEST_DIR = '/var/lib/kl2xkb'
+SYSTEM_MANIFEST_FILE = os.path.join(SYSTEM_MANIFEST_DIR, 'manifest.json')
+
+
+def system_symbols_writable():
+    """True when the system symbols dir sits on a writable filesystem.
+
+    Detects immutable/read-only-/usr distros BEFORE any escalation attempt:
+    ST_RDONLY is a mount property, visible without privileges. A False here
+    means system mode should be declined with a pointer to user mode (write
+    PERMISSION is root's concern; a read-only MOUNT defeats root too).
+    """
+
+    directory = SYSTEM_SYMBOLS_DIR
+    while directory and not os.path.isdir(directory):
+        directory = os.path.dirname(directory)
+    if not directory:
+        return False
+    try:
+        flags = os.statvfs(directory).f_flag
+    except OSError:
+        return False
+    return not (flags & os.ST_RDONLY)
+
+
+def _load_system_manifest():
+    text = _read(SYSTEM_MANIFEST_FILE)
+    if not text:
+        return {'files': {}}
+    try:
+        manifest = json.loads(text)
+    except ValueError:
+        return {'files': {}}
+    if not isinstance(manifest, dict) or 'files' not in manifest:
+        return {'files': {}}
+    return manifest
+
+
+def stage_system_symbols(records, directory):
+    """Write the per-base symbols files into 'directory' for a system apply.
+
+    Returns the list of staged file names ('plx', 'usx', ...). The staged
+    content is byte-identical to what user mode would write; only the final
+    destination differs.
+    """
+
+    os.makedirs(directory, exist_ok=True)
+    names = []
+    for base, content in build_symbols_files(records).items():
+        name = k2x_base_name(base)
+        with open(os.path.join(directory, name), 'w', encoding='utf-8') as fh:
+            fh.write(content)
+        names.append(name)
+    return sorted(names)
+
+
+def system_apply(staged_dir):
+    """Apply staged symbols files to the system location (run as root).
+
+    Safety rules, in order: every staged file must carry the managed-region
+    marker (refuse to stage arbitrary content into the system tree); an
+    existing TARGET that lacks the marker and is not in the system manifest is
+    NEVER overwritten (refuse loudly -- it is somebody else's file); writes go
+    through a temp file in the target directory plus os.replace (atomic on the
+    same filesystem); and a failure mid-batch restores every file already
+    replaced in this run (byte-for-byte) before returning.
+
+    Returns {'written': [...], 'refused': [...], 'error': str | None}.
+    """
+
+    result = {'written': [], 'refused': [], 'error': None}
+    manifest = _load_system_manifest()
+
+    staged = []
+    for name in sorted(os.listdir(staged_dir)):
+        full = os.path.join(staged_dir, name)
+        if not os.path.isfile(full):
+            continue
+        content = _read(full)
+        if not content or _BEGIN not in content:
+            result['refused'].append('%s (staged file lacks the managed '
+                                     'marker)' % name)
+            continue
+        staged.append((name, content))
+
+    backups = []                    # (target_path, previous_content | None)
+    try:
+        for name, content in staged:
+            target = os.path.join(SYSTEM_SYMBOLS_DIR, name)
+            existing = _read(target)
+            if (existing is not None and _BEGIN not in existing
+                    and name not in manifest['files']):
+                result['refused'].append('%s (existing system file is not '
+                                         'kl2xkb-managed)' % name)
+                continue
+            backups.append((target, existing))
+            temp_path = target + '.kl2xkb-new'
+            with open(temp_path, 'w', encoding='utf-8') as fh:
+                fh.write(content)
+            os.chmod(temp_path, 0o644)
+            os.replace(temp_path, target)
+            manifest['files'][name] = {'bytes': len(content)}
+            result['written'].append(name)
+
+        os.makedirs(SYSTEM_MANIFEST_DIR, exist_ok=True)
+        with open(SYSTEM_MANIFEST_FILE, 'w', encoding='utf-8') as fh:
+            fh.write(json.dumps(manifest, indent=2, ensure_ascii=False))
+    except Exception as error:
+        for target, previous in backups:
+            try:
+                if previous is None:
+                    if os.path.exists(target):
+                        os.remove(target)
+                else:
+                    with open(target, 'w', encoding='utf-8') as fh:
+                        fh.write(previous)
+            except OSError:
+                pass
+        result['error'] = str(error)
+    return result
+
+
+def system_remove():
+    """Remove every manifest-listed system symbols file (run as root).
+
+    A target is only removed while it still carries the managed marker; a
+    file someone replaced by hand is left alone and reported. Returns
+    {'removed': [...], 'skipped': [...]}.
+    """
+
+    result = {'removed': [], 'skipped': []}
+    manifest = _load_system_manifest()
+    for name in sorted(manifest['files']):
+        target = os.path.join(SYSTEM_SYMBOLS_DIR, name)
+        existing = _read(target)
+        if existing is None:
+            result['skipped'].append('%s (already gone)' % name)
+        elif _BEGIN not in existing:
+            result['skipped'].append('%s (no longer kl2xkb-managed; left '
+                                     'in place)' % name)
+        else:
+            os.remove(target)
+            result['removed'].append(name)
+    if os.path.isdir(SYSTEM_MANIFEST_DIR):
+        try:
+            os.remove(SYSTEM_MANIFEST_FILE)
+            os.rmdir(SYSTEM_MANIFEST_DIR)
+        except OSError:
+            pass
+    return result
+
+
+def system_installed():
+    """Return [(name, still_present)] for manifest-listed system files."""
+
+    manifest = _load_system_manifest()
+    return [
+        (name, os.path.isfile(os.path.join(SYSTEM_SYMBOLS_DIR, name)))
+        for name in sorted(manifest['files'])
+    ]
 
 
 def dump_records(records, directory):

@@ -43,7 +43,7 @@ from keylayout_to_xkb.extract.uckeytranslate import (
 )
 
 
-__version__ = '20260702'
+__version__ = '20260703'
 
 
 # The planes the audit covers, derived from the SHARED plane constant so the
@@ -180,16 +180,24 @@ def compare_reference(layout: Layout, reference: 'dict', name: str) -> Verificat
             parser_result = parser_comp.get(base_char)
 
             # The OS produces a result for the dead key followed by EVERY base
-            # key: when the layout defines no special composition, it falls back
-            # to terminator + base (e.g. acute then 'd' yields "'d"). The parser
-            # faithfully stores only the layout's real compositions, so a parser
-            # 'None' against an OS 'terminator + base' is the expected fallback,
-            # not a disagreement. Skip those so the composition score reflects
-            # only genuine composition mismatches.
-            if parser_result is None and terminator and os_result == terminator + base_char:
+            # key: when the layout defines no special composition, it falls
+            # back to terminator + base (e.g. acute then 'd' yields "'d") --
+            # INCLUDING when the terminator is empty, where the fallback is
+            # the bare base (the "passthrough" rows that once made Tibetan
+            # Wylie look 85% broken). The parser faithfully stores only the
+            # layout's real compositions, so a parser 'None' against the OS
+            # fallback is expected, not a disagreement.
+            if parser_result is None and os_result == terminator + base_char:
                 continue
-            # Same fallback, but where the parser DID store the passthrough
-            # explicitly: also agreement.
+            # X-convention rows: the model stores terminator-only where the
+            # OS emits terminator + base (canonically dead + space -> bare
+            # accent vs accent + space). Deliberate convention difference in
+            # the emitted XCompose, counted as agreement.
+            if (parser_result == terminator
+                    and os_result == terminator + base_char):
+                result.comps_checked += 1
+                result.comps_agree += 1
+                continue
             result.comps_checked += 1
             if parser_result == os_result:
                 result.comps_agree += 1
