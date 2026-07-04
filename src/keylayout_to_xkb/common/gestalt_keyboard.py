@@ -42,23 +42,33 @@ layout is asked "do you advertise any of these?" and the first covered one is
 used to resolve that kind's table.
 """
 
-__version__ = '20260626'
+__version__ = '20260704b'
 
 
 # Gestalt keyboard-type number -> physical kind. Read off the ...ANSIKbd /
 # ...ISOKbd / ...JISKbd (and ...DomKbd -> ANSI) constant names in Gestalt.h.
 # Numbers absent here are generic/kind-less (early ADB, PS/2, adjustable, the
 # obsolete type 3): they form the 'unlabeled' default layout.
+# AUTHORITY: Apple's own runtime table, dumped via KBGetLayoutType
+# (probe_kbgetlayouttype_dump; the values are FourCC 'ANSI'/'ISO '/'JIS ').
+# Three corrections vs the classic Gestalt.h constant-name reading landed
+# from that dump: Apple classifies 8 and 16 as ANSI (Gestalt names read
+# ISO) and 17 as ISO (read JIS). Types Apple answers '????' for (11, 19,
+# and everything past 207) keep the Gestalt-name classification where one
+# exists and stay unclassified otherwise.
 KIND_BY_TYPE = {
-    # ISO
-    7: 'ISO', 8: 'ISO', 9: 'ISO', 11: 'ISO', 13: 'ISO', 16: 'ISO', 20: 'ISO',
-    29: 'ISO', 32: 'ISO', 35: 'ISO', 38: 'ISO', 41: 'ISO',
+    # ISO (17 per Apple's runtime table, corrected from JIS)
+    7: 'ISO', 9: 'ISO', 11: 'ISO', 13: 'ISO', 17: 'ISO', 20: 'ISO',
+    29: 'ISO', 32: 'ISO', 35: 'ISO', 38: 'ISO', 41: 'ISO', 92: 'ISO',
     196: 'ISO', 199: 'ISO', 203: 'ISO', 205: 'ISO',
-    # JIS
-    17: 'JIS', 21: 'JIS', 30: 'JIS', 33: 'JIS', 36: 'JIS', 39: 'JIS', 42: 'JIS',
+    # JIS (192 per Apple: the PwrBook-Sub-era value behind the containment
+    # inversion)
+    21: 'JIS', 30: 'JIS', 33: 'JIS', 36: 'JIS', 39: 'JIS', 42: 'JIS',
+    93: 'JIS', 192: 'JIS', 194: 'JIS',
     197: 'JIS', 200: 'JIS', 201: 'JIS', 206: 'JIS', 207: 'JIS',
-    # ANSI (includes the "Domestic" keyboards)
-    28: 'ANSI', 31: 'ANSI', 34: 'ANSI', 37: 'ANSI', 40: 'ANSI',
+    # ANSI (8 and 16 per Apple, corrected from ISO; includes "Domestic")
+    8: 'ANSI', 16: 'ANSI', 28: 'ANSI', 31: 'ANSI', 34: 'ANSI', 37: 'ANSI',
+    40: 'ANSI', 58: 'ANSI', 91: 'ANSI', 193: 'ANSI',
     195: 'ANSI', 198: 'ANSI', 202: 'ANSI', 204: 'ANSI',
 }
 
@@ -67,6 +77,13 @@ KIND_BY_TYPE = {
 # layout "which of these do you advertise?" and resolve that kind from the first
 # match. The spread (USB, then older ADB/PowerBook) maximizes the chance of a
 # hit across the wide variety of vintages 'uchr' files target.
+# MEMBERSHIP IS EVIDENCE-FROZEN: these exact lists matched the OS at 100%
+# across the full 241-layout coverage audit. A rebuild that moved 8/16/17 to
+# follow their Apple-corrected KINDS broke Persian -- Standard (adding 16/8
+# to the ANSI chain resolved type 91 to a record the OS does not use), so
+# the lists encode the OS's empirical canonical chains, not kind purity --
+# 17 sits in the JIS chain and 8/16 in ISO exactly as the catalog demands.
+# Change membership only against a fresh full-coverage run.
 REPRESENTATIVE_TYPES = {
     'ANSI': [40, 37, 34, 31, 198, 204, 202, 195, 28],
     'ISO':  [41, 38, 35, 32, 199, 205, 203, 196, 29, 20, 16, 13, 11, 9, 8, 7],
@@ -77,6 +94,20 @@ REPRESENTATIVE_TYPES = {
 # The four labels a layout may be split into. 'unlabeled' is the generic/default
 # table reached by kind-less types; the others are emitted only when advertised.
 KIND_LABELS = ('unlabeled', 'ANSI', 'ISO', 'JIS')
+
+
+# Types the OS TRANSLATES through their kind BEFORE any range containment.
+# Evidence, two probes deep: (1) probe_kbdtype_resolution -- Arabic covers 91
+# inside a 41-194 range yet UCKeyTranslate answers with the ANSI tables for
+# 58 and 91, and Russian -- PC inverts covered 192/193 against their own
+# records; (2) probe_kbgetlayouttype_dump -- Apple's runtime table gives
+# exactly the kinds that make every one of those points resolve (58/91/193
+# ANSI, 192 JIS, and 92/93 as the modern ISO/JIS hardware values, added on
+# the same evidence class as 91). Legacy classified types demonstrably DO
+# honor containment -- type 16 is the standing proof: Apple classifies it
+# ANSI, yet Arabic resolves it by range into the non-ANSI set. Extend this
+# set only with probe evidence, never analogy.
+MODERN_TRANSLATED_TYPES = frozenset((58, 91, 92, 93, 192, 193))
 
 
 def kind_of_type(type_number: int) -> 'str | None':

@@ -43,7 +43,7 @@ from keylayout_to_xkb.extract.uckeytranslate import (
 )
 
 
-__version__ = '20260703'
+__version__ = '20260703b'
 
 
 # The planes the audit covers, derived from the SHARED plane constant so the
@@ -218,9 +218,16 @@ def verify_layout(data: bytes, name: str) -> VerificationResult:
     """
 
     from keylayout_to_xkb.extract.uchr_parse import parse_uchr
+    from keylayout_to_xkb.extract.uckeytranslate import _load_uckeytranslate
 
     reference = build_os_reference(data)            # raises OSOracleUnavailable off mac
-    layout = parse_uchr(data, layout_name=name)
+    # Parse from the record covering the Mac's REAL keyboard type: the oracle
+    # answers with that type's tables, and multi-record layouts (Russian --
+    # PC and the rest of the PC family) differ per type at the ANSI/ISO
+    # geometry keys -- comparing against the generic record misreads those
+    # cells as divergences.
+    _handle, kbd_type = _load_uckeytranslate()
+    layout = parse_uchr(data, layout_name=name, kbd_type=kbd_type)
 
     # Plane-coverage cross-check: the audit must be ABLE to disagree with the
     # resolver about which planes exist. A parser plane the OS reference never

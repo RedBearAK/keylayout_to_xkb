@@ -38,7 +38,7 @@ from keylayout_to_xkb.emit.classify import (
 )
 
 
-__version__ = '20260703'
+__version__ = '20260703b'
 
 
 def _escape_result(text: str) -> str:
@@ -62,6 +62,16 @@ def _codepoint_comment(text: str) -> str:
 # Stacked dead-key chains bound: Tibetan Wylie reaches depth 4; the cap only
 # guards against a malformed cyclic graph ever looping the walk.
 _MAX_CHAIN_DEPTH = 6
+
+# Layouts whose chain graph is an intentional ALL-OF-UNICODE accumulator:
+# Unicode Hex Input encodes typing four hex digits as 16 transitions per
+# state, four deep -- 65536 leaf compositions whose XCompose expansion would
+# be megabytes of lines verifying nothing (Linux natively offers
+# Ctrl+Shift+U for the same job). Blocked BY NAME per project decision: no
+# shape heuristics; every other layout's chains are followed to the end.
+_CHAIN_BLOCKED_LAYOUTS = frozenset((
+    'unicode hex input',
+))
 
 
 def _state_trigger(state_name, dead_state, placeholders):
@@ -213,8 +223,13 @@ def emit_compose(layout: Layout, header_note: str = '') -> str:
                             _codepoint_comment(dead_state.terminator)))
             total += 1
 
-        total += _emit_state_lines(
-            layout, placeholders, dead_state, (trigger,), {state_name}, lines)
+        if (layout.name or '').strip().lower() in _CHAIN_BLOCKED_LAYOUTS:
+            lines.append('# chain expansion intentionally skipped for this '
+                         'layout (all-of-Unicode accumulator)')
+        else:
+            total += _emit_state_lines(
+                layout, placeholders, dead_state, (trigger,), {state_name},
+                lines)
 
         lines.append('')
 

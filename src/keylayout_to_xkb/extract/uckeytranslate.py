@@ -45,7 +45,7 @@ from keylayout_to_xkb.common.models import (
 )
 
 
-__version__ = '20260703b'
+__version__ = '20260703d'
 
 
 def _utf16_units_to_str(out_buffer, length: int) -> str:
@@ -410,6 +410,32 @@ def _translate_full(handle, layout_ptr, kbd_type, virtual_key, modifier_byte):
     return output, dead_key_state.value
 
 
+def _translate_step(handle, layout_ptr, kbd_type, virtual_key, modifier_byte,
+                    dead_state_in):
+    """One keypress WITHIN a dead-key sequence: returns (output, dead_state).
+
+    The general chaining primitive: feeds 'dead_state_in' into UCKeyTranslate
+    and returns both the produced string and the successor state, so a caller
+    can walk multi-key stacking sequences (Tibetan, polytonic) step by step.
+    _translate_full is the dead_state_in=0 special case; _compose_after is
+    the discard-the-successor special case. Returns ('', 0) on error.
+    """
+
+    state = ctypes.c_uint32(dead_state_in)
+    buffer_len = 16
+    actual_len = ctypes.c_ulong(0)
+    out_buffer = (ctypes.c_uint16 * buffer_len)()
+
+    status = handle.UCKeyTranslate(
+        layout_ptr, virtual_key, _KEY_ACTION_DOWN, modifier_byte, kbd_type,
+        0, ctypes.byref(state), buffer_len,
+        ctypes.byref(actual_len), out_buffer,
+    )
+    if status != 0:
+        return '', 0
+    return _utf16_units_to_str(out_buffer, actual_len.value), state.value
+
+
 def _compose_after(handle, layout_ptr, kbd_type, dead_state, base_vk, base_mod):
     """Given an active dead_state, translate base_vk to get the composed result.
 
@@ -475,12 +501,21 @@ def build_os_reference(data: bytes) -> 'dict':
 
             if is_dead:
                 # Probe the composition table: this dead key followed by every
-                # plain and shift base key. Record only non-empty results.
+                # base key on EVERY plane. Two flaws in the original
+                # plain+shift-only probing produced ~130 phantom composition
+                # divergences (Vietnamese, Azeri, the Sami PC family):
+                #   1. composition reachability is per-CELL, and the cell that
+                #      actually composes for a character can live on the caps
+                #      or option planes, which were never pressed;
+                #   2. two cells producing the SAME base character (one
+                #      composing, one literal) collided in this dict with
+                #      last-writer-wins, so a literal cell's fallback result
+                #      could clobber the real composition.
+                # Both are cured by pressing all planes and never letting a
+                # fallback-SHAPED result (ending with the base character:
+                # terminator + base) overwrite a composition-shaped one.
                 comp = {}
-                for base_plane, base_mod in (
-                    ('plain', PLANE_MODIFIER_BYTE[ModifierState.PLAIN]),
-                    ('shift', PLANE_MODIFIER_BYTE[ModifierState.SHIFT]),
-                ):
+                for base_plane, base_mod in plane_bytes:
                     for base_vk in _REFERENCE_VKS:
                         base_char, _ = _translate_full(
                             handle, layout_ptr, kbd_type, base_vk, base_mod
@@ -491,7 +526,17 @@ def build_os_reference(data: bytes) -> 'dict':
                             handle, layout_ptr, kbd_type, dead_state,
                             base_vk, base_mod
                         )
-                        if result:
+                        if not result:
+                            continue
+                        existing = comp.get(base_char)
+                        result_is_fallback = (
+                            len(result) > 1 and result.endswith(base_char))
+                        existing_is_fallback = (
+                            existing is not None and len(existing) > 1
+                            and existing.endswith(base_char))
+                        if existing is None:
+                            comp[base_char] = result
+                        elif existing_is_fallback and not result_is_fallback:
                             comp[base_char] = result
                 if comp:
                     compositions[(vk, plane_name)] = comp

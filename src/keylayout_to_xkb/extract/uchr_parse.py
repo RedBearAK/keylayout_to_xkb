@@ -28,12 +28,14 @@ from keylayout_to_xkb.common.models import (
 )
 from keylayout_to_xkb.extract.uckeytranslate import resolve_plane_tables_via_os
 from keylayout_to_xkb.common.gestalt_keyboard import (
+    kind_of_type,
     lowest_generic_type,
+    MODERN_TRANSLATED_TYPES,
     representative_type_for_kind,
 )
 
 
-__version__ = '20260703e'
+__version__ = '20260704'
 
 
 _EXPECTED_HEADER_FORMAT     = 0x1002
@@ -102,6 +104,114 @@ def _read_keyboard_type_records(data: bytes, count: int) -> 'list[dict]':
     return records
 
 
+def _record_for_kbd_type(records: 'list[dict]',
+                         kbd_type: int) -> 'dict | None':
+    """The keyboard-type record UCKeyTranslate resolves 'kbd_type' to.
+
+    The rule, validated against EVERY sweep point of probe_kbdtype_resolution
+    on Russian -- PC (47/47) and both multi-record Arabic layouts (56/56):
+    types in MODERN_TRANSLATED_TYPES resolve through their kind's
+    representative chain, FINALLY -- no covered representative means record 0
+    (the OS never consults the raw number once it translates; Russian covers
+    192 with its own record and no JIS type at all, and the OS resolves 192,
+    a JIS type per Apple's KBGetLayoutType table, to record 0). Every other
+    type uses range CONTAINMENT first (type 16 is the standing proof: Apple
+    classifies it ANSI, yet Arabic resolves it by range into the non-ANSI
+    set), then the kind-representative fallback for uncovered values; a type
+    with no known kind resolves to None (caller uses record 0). The 192/193
+    inversion that was once a documented anomaly is now fully explained and
+    encoded: Apple's runtime table classifies 192 JIS and 193 ANSI, and the
+    translation-is-final rule produces the exact observed behavior.
+    """
+
+    def covered(type_number):
+        return any(record['first'] <= type_number <= record['last']
+                   for record in records)
+
+    def record_containing(type_number):
+        for record in records:
+            if record['first'] <= type_number <= record['last']:
+                return record
+        return None
+
+    def record_via_kind(type_number):
+        kind = kind_of_type(type_number)
+        if kind is None:
+            return None
+        representative = representative_type_for_kind(kind, covered)
+        if representative is None:
+            return None
+        return record_containing(representative)
+
+    if kbd_type in MODERN_TRANSLATED_TYPES:
+        # TRANSLATION IS FINAL: once the OS maps a translated type through
+        # its kind, the raw number is never consulted again -- Russian -- PC
+        # covers 192 with its own record, covers NO JIS type at all, and the
+        # OS resolves 192 (JIS) to record 0, not to 192's own record. A None
+        # here therefore means record 0 (the caller's default), never a
+        # containment retry.
+        return record_via_kind(kbd_type)
+    resolved = record_containing(kbd_type)
+    if resolved is not None:
+        return resolved
+    return record_via_kind(kbd_type)
+
+
+def _referenced_state_records(data: bytes,
+                              records: 'list[dict]') -> frozenset:
+    """Indices of state records referenced by at least one cell anywhere.
+
+    Scans, for every keyboard-type record (deduped by char index offset),
+    ONLY the char tables reachable through the eight CANONICAL plane bytes
+    of that record's modifier map, for state-flagged entries with in-range
+    indices (the same discrimination _entry_to_key_output applies).
+
+    The canonical-plane scoping is load-bearing: Kabyle -- QWERTY's '2'
+    record is referenced solely from a table reached only via
+    command-modifier bytes, and on real hardware the OS composes there ONLY
+    with cmd held -- plain dead-key + 2 gives the fallback. The emitted
+    layout covers the eight canonical planes, so compose claims must too.
+    """
+
+    referenced = set()
+    seen_indexes = set()
+    for record in records:
+        char_index_offset = record['char_index_offset']
+        if char_index_offset in seen_indexes:
+            continue
+        seen_indexes.add(char_index_offset)
+        state_records_offset = record['state_records_offset']
+        if state_records_offset:
+            record_count = struct.unpack_from(
+                '<H', data, state_records_offset + 2)[0]
+        else:
+            record_count = 0
+        table_map, default_table = _parse_modifier_table_map(
+            data, record['mod_to_table_offset'])
+        char_tables = _parse_char_table_index(data, char_index_offset)
+        canonical_tables = set()
+        for modifier_byte in PLANE_MODIFIER_BYTE.values():
+            if 0 <= modifier_byte < len(table_map):
+                table_index = table_map[modifier_byte]
+            else:
+                table_index = default_table
+            if 0 <= table_index < len(char_tables):
+                canonical_tables.add(table_index)
+        for table_index in sorted(canonical_tables):
+            offset, size = char_tables[table_index]
+            for virtual_key in range(size):
+                entry = struct.unpack_from(
+                    '<H', data, offset + 2 * virtual_key)[0]
+                if entry in (_OUTPUT_EMPTY_A, _OUTPUT_EMPTY_B):
+                    continue
+                if (entry & _FLAG_TEST_MASK) != _FLAG_STATE:
+                    continue
+                state_index = entry & _INDEX_MASK
+                if state_index < record_count:
+                    referenced.add(state_index)
+    return frozenset(referenced)
+
+
 def _table_identity(record: 'dict') -> tuple:
     """Full offset tuple identifying a record's physical layout.
 
@@ -119,7 +229,8 @@ def _table_identity(record: 'dict') -> tuple:
     )
 
 
-def _resolve_kind_variants(data: bytes, records: 'list[dict]') -> 'list[dict]':
+def _resolve_kind_variants(data: bytes, records: 'list[dict]',
+                           preferred_type: 'int | None' = None) -> 'list[dict]':
     """Resolve the variant set: generic primary plus each advertised kind.
 
     Returns an ordered list of {tag, record, type, range} dicts. The first is
@@ -149,13 +260,25 @@ def _resolve_kind_variants(data: bytes, records: 'list[dict]') -> 'list[dict]':
     seen_tables = set()
 
     # Primary: the generic/default table (kind-less type), else first record.
-    generic_type = lowest_generic_type(ranges)
-    if generic_type is not None:
-        primary_record = record_for(generic_type)
-        primary_type = generic_type
-    else:
-        primary_record = records[0]
-        primary_type = records[0]['first']
+    # A caller auditing against the OS oracle passes the Mac's REAL keyboard
+    # type as preferred_type: multi-record layouts (Russian -- PC carries 27
+    # records in two table sets differing at the ANSI/ISO geometry keys) give
+    # UCKeyTranslate the tables for THAT type, so the audited model must be
+    # built from the same record or every geometry-key cell reads as a
+    # divergence. Emission never passes it (variants cover the kinds).
+    primary_record = None
+    primary_type = None
+    if preferred_type is not None:
+        primary_record = _record_for_kbd_type(records, preferred_type)
+        primary_type = preferred_type
+    if primary_record is None:
+        generic_type = lowest_generic_type(ranges)
+        if generic_type is not None:
+            primary_record = record_for(generic_type)
+            primary_type = generic_type
+        else:
+            primary_record = records[0]
+            primary_type = records[0]['first']
     variants.append({
         'tag': '',
         'record': primary_record,
@@ -227,7 +350,8 @@ def _build_variant_keys(
 
 
 def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '',
-               languages: 'list | None' = None) -> Layout:
+               languages: 'list | None' = None,
+               kbd_type: 'int | None' = None) -> Layout:
     """Parse a single 'uchr' byte buffer into a normalized Layout.
 
     languages, when provided, is Apple's authoritative ISO 639 language list for
@@ -261,28 +385,51 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '',
         f'keyboard_type_count={keyboard_type_count}'
     )
 
-    type_header_base = 12
-    _check_bounds(data, type_header_base, 28, 'keyboard-type header[0]')
+    all_records = _read_keyboard_type_records(data, keyboard_type_count)
 
-    (
-        kbd_type_first,
-        kbd_type_last,
-        mod_to_table_offset,
-        char_index_offset,
-        state_records_offset,
-        state_terminators_offset,
-        sequence_data_offset,
-    ) = struct.unpack_from('<IIIIIII', data, type_header_base)
+    # Which state records does ANY cell reference, on ANY keyboard type? A
+    # state record referenced by no cell anywhere is VESTIGIAL: its entries
+    # describe compositions no keypress can ever trigger, so the OS never
+    # produces them and an emitted XCompose line for them would be inert.
+    # Apple ships such orphans (Finnish Sami PC: 'i'/'I' records; Azeri:
+    # 'I'/'W'/'w' plus Nordic leftovers; Tibetan Wylie: the Latin vowels).
+    # The union across keyboard types keeps anything reachable on at least
+    # one physical keyboard kind.
+    if kbd_type is not None:
+        audit_record = _record_for_kbd_type(all_records, kbd_type)
+        scope_records = [audit_record] if audit_record else [all_records[0]]
+    else:
+        scope_records = all_records
+    referenced_records = _referenced_state_records(data, scope_records)
+
+    # The PRIMARY parse's section offsets come from record 0 -- UNLESS the
+    # caller passed the Mac's real keyboard type (the OS-oracle audit paths
+    # do): multi-record layouts carry per-type table sets (Russian -- PC has
+    # 27 records in two sets differing at the ANSI/ISO geometry keys), and
+    # UCKeyTranslate answers with the tables for the REAL type, so the
+    # audited model must read the same record. Emission never passes
+    # kbd_type; the kind variants cover the per-type tables there.
+    source_record = None
+    if kbd_type is not None:
+        source_record = _record_for_kbd_type(all_records, kbd_type)
+    if source_record is None:
+        source_record = all_records[0]
+
+    kbd_type_first = source_record['first']
+    kbd_type_last = source_record['last']
+    mod_to_table_offset = source_record['mod_to_table_offset']
+    char_index_offset = source_record['char_index_offset']
+    state_records_offset = source_record['state_records_offset']
+    state_terminators_offset = source_record['state_terminators_offset']
+    sequence_data_offset = source_record['sequence_data_offset']
 
     dbg(
         'uchr',
-        f'type[0] first={kbd_type_first} last={kbd_type_last} '
+        f'primary record: first={kbd_type_first} last={kbd_type_last} '
         f'char_index_off={char_index_offset} '
         f'state_records_off={state_records_offset} '
         f'seq_data_off={sequence_data_offset}'
     )
-
-    all_records = _read_keyboard_type_records(data, keyboard_type_count)
     if keyboard_type_count > 1:
         dbg('uchr', f'note: {keyboard_type_count} keyboard-type records')
 
@@ -411,7 +558,8 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '',
     dbg('uchr', f'terminators: {len(terminators)}')
 
     _build_dead_states(
-        layout, state_records, sequences, terminators
+        layout, state_records, sequences, terminators,
+        referenced_records=referenced_records,
     )
     dbg('uchr', f'dead states: {layout.dead_key_count()}')
 
@@ -428,7 +576,8 @@ def parse_uchr(data: bytes, layout_name: str = '', source_id: str = '',
     # ANSI/ISO/JIS kinds that resolve to distinct physical tables). The primary
     # carries the keys already populated above; additional kinds each become a
     # self-contained Variant. Dead states are shared across all variants.
-    kind_variants = _resolve_kind_variants(data, all_records)
+    kind_variants = _resolve_kind_variants(
+        data, all_records, preferred_type=kbd_type)
     primary = kind_variants[0]
     layout.variants.append(Variant(
         tag='',
@@ -1029,6 +1178,7 @@ def _build_dead_states(
     state_records: 'list[dict]',
     sequences: 'list[str]',
     terminators: 'list[str]',
+    referenced_records: frozenset = frozenset(),
 ) -> None:
     """Create DeadState objects and fill their compositions and terminators.
 
@@ -1099,7 +1249,15 @@ def _build_dead_states(
         return dead_state
 
     unaddressable = 0
+    empty_results = 0
+    orphan_records = 0
+    orphan_entries = 0
     for record_index, record in enumerate(state_records):
+        if record_index not in referenced_records:
+            if record['entries'] or record.get('transitions'):
+                orphan_records += 1
+                orphan_entries += len(record['entries'])
+            continue
         base_char = base_char_for_record.get(record_index)
         # The in-state TRIGGER identity of this record's key: a literal char
         # (keyed by it, as compositions always were) or a dead key (keyed by
@@ -1115,9 +1273,45 @@ def _build_dead_states(
             if base_char is None and trigger_state is None:
                 unaddressable += 1
                 continue
-            dead_state = _ensure_state(cur_state)
             result = _resolve_char_data(char_data, sequences)
+            if not result:
+                # An entry resolving to the empty string (an empty sequence-
+                # table slot) is non-emitting: the OS falls back to
+                # terminator + base for it, so storing an empty composition
+                # would claim output that never happens (and emit a
+                # ': ""' XCompose line). Tibetan Otani/QWERTY carry these.
+                empty_results += 1
+                continue
+            dead_state = _ensure_state(cur_state)
             if base_char is not None:
+                # IDENTITY entries (result == the record's own base char) are
+                # REAL compositions: the OS emits the bare base at the
+                # referencing cell (proven at catalog scale -- Tongan alone
+                # has 183 of them, plus Croatian, Kurmanji, Romanian, South
+                # Sami and Tibetan Wylie; an experiment that dropped them
+                # turned all of those into audit divergences). Their one
+                # special property is COLLISION RANK: several referenced
+                # records can share a base char (Tongan's N key carries a
+                # record per plane, only the shift-plane one composing
+                # N-grave/N-acute, the others holding identity entries), and
+                # since one XCompose keysym maps to one result, an identity
+                # never overwrites a differing result and a differing result
+                # replaces an identity. Two DIFFERENT non-identity results
+                # colliding would be a decision rule we do not understand:
+                # warn loudly, keep the first. Open anomaly: Kabyle --
+                # QWERTY's dead-11 '2' identity entry audits as a fallback on
+                # real hardware; unresolved pending its specimen bytes.
+                existing = dead_state.compositions.get(base_char)
+                if existing is not None and existing != result:
+                    if result == base_char:
+                        continue                    # identity loses
+                    if existing != base_char:
+                        warn('uchr', f'{layout.name!r}: state '
+                             f'{dead_state.name}: two DIFFERENT non-identity '
+                             f'compositions collide for base {base_char!r} '
+                             f'({existing!r} vs {result!r}); keeping the '
+                             f'first (decision rule not understood)')
+                        continue
                 dead_state.compositions[base_char] = result
             else:
                 dead_state.dead_compositions[trigger_state] = result
@@ -1137,6 +1331,13 @@ def _build_dead_states(
         dbg('uchr', f'{layout.name!r}: {unaddressable} in-state entr(y/ies) '
             'belong to keys with no ground identity; not expressible as '
             'compose sequences')
+    if empty_results:
+        dbg('uchr', f'{layout.name!r}: {empty_results} in-state entr(y/ies) '
+            'resolve to empty output; treated as non-emitting fallbacks')
+    if orphan_records:
+        dbg('uchr', f'{layout.name!r}: {orphan_records} vestigial state '
+            f'record(s) referenced by no cell on any keyboard type skipped '
+            f'({orphan_entries} unreachable composition entr(y/ies))')
 
 
 def _populate_keys(
