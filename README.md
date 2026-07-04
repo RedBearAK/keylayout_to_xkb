@@ -73,7 +73,7 @@ keylayout-to-xkb --filter 'Polish' --make-installer
 On the Linux machine (install):
 
 ```
-python3 install_<name>.py
+python3 install_xkb_layouts_<N>.py
 ```
 
 The installer is a self-contained Python script — invoke it through

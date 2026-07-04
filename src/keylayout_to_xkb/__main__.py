@@ -231,18 +231,19 @@ def _versioned_dir(path):
     return '%s_%d' % (path, counter)
 
 
-def _resolve_installer_filename(given):
+def _resolve_installer_filename(given, layout_count=0):
     """Resolve the bundled single-file installer path.
 
-    given is None/'' (auto-name) or a user string. Auto: the fixed standard name
-    'install_generated_xkb_layouts.py'. User-supplied: sanitized strictest, .py
+    given is None/'' (auto-name) or a user string. Auto: a count-based name,
+    'install_xkb_layouts_<N>.py' -- deliberately generic (no filter or language
+    hints; the count is the one honest summary of any selection). User-supplied: sanitized strictest, .py
     enforced, NO forced install_ prefix or _kl2xkb suffix (those are only for
     auto-named files). If sanitization changed a user name, confirm it (or use
     it silently when no TTY). Returns the path, or None to abort.
     """
 
     if not given:
-        return 'install_generated_xkb_layouts.py'
+        return 'install_xkb_layouts_%d.py' % layout_count
 
     # Preserve any directory the user gave; sanitize only the filename part.
     directory = os.path.dirname(given)
@@ -591,7 +592,8 @@ def main(argv: 'list[str] | None' = None) -> int:
             return 0
 
         # Single bundled installer.
-        out_path = _resolve_installer_filename(args.make_installer)
+        out_path = _resolve_installer_filename(
+            args.make_installer, layout_count=len(built_records))
         if out_path is None:
             return 2
         out_path = _resolve_collision_file(out_path)
