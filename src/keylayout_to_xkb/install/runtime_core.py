@@ -18,12 +18,13 @@ and can never disturb other layouts or system/user files.
 """
 
 import os
+import sys
 import json
 
 from xml.sax.saxutils import escape as _xml_escape
 
 
-__version__ = '20260704'
+__version__ = '20260704b'
 
 
 _NAMESPACE = 'keylayout_to_xkb'
@@ -388,6 +389,36 @@ def _rebuild_managed_files(paths, manifest, force, write_symbols=True):
     return status, merged
 
 
+def _call_with_fd2_captured(call):
+    """Run call() with OS-level stderr redirected into a capture buffer.
+
+    libxkbcommon logs compile diagnostics with fprintf straight to file
+    descriptor 2 -- invisible to Python-level redirection, and eaten by the
+    TUI's alternate screen before anyone can read it. Duplicating fd 2 onto
+    a temp file for the duration captures every byte the C side emits.
+    Returns (result, captured_text). tempfile is a lazy import to keep the
+    generated installer's import surface unchanged (precedent: ctypes in
+    validate_keymap).
+    """
+
+    import tempfile
+
+    sys.stderr.flush()
+    saved_fd = os.dup(2)
+    capture = tempfile.TemporaryFile()
+    os.dup2(capture.fileno(), 2)
+    try:
+        result = call()
+    finally:
+        sys.stderr.flush()
+        os.dup2(saved_fd, 2)
+        os.close(saved_fd)
+    capture.seek(0)
+    captured = capture.read().decode('utf-8', errors='replace')
+    capture.close()
+    return result, captured
+
+
 def validate_keymap(identifier, variant_name, paths=None):
     """Compile one installed layout the way a Wayland compositor does, returning
     (ok, error_text).
@@ -400,9 +431,14 @@ def validate_keymap(identifier, variant_name, paths=None):
     supplies its own types) does NOT exercise this and cannot catch rules/types
     structural bugs, which is how a session-breaking install slipped through once.
 
-    Returns (True, '') on success, (False, message) on a compile failure. If
-    libxkbcommon is unavailable it returns (True, 'unavailable'); on a real Linux
-    target it is always present (it is the compositor's own library).
+    Returns (ok, message, diagnostics): (True, '', diagnostics) on success,
+    (False, message, diagnostics) on a compile failure -- diagnostics being
+    whatever the C side printed to fd 2 during the compile (possibly empty,
+    and possibly non-empty even on success: libxkbcommon reports recoverable
+    problems like unknown keysyms as [ERROR] lines while still assembling a
+    keymap). If libxkbcommon is unavailable it returns (True, 'unavailable',
+    ''); on a real Linux target it is always present (it is the compositor's
+    own library).
     """
 
     import ctypes
@@ -410,7 +446,7 @@ def validate_keymap(identifier, variant_name, paths=None):
 
     libname = ctypes.util.find_library('xkbcommon')
     if not libname:
-        return True, 'unavailable'
+        return True, 'unavailable', ''
     try:
         xkb = ctypes.CDLL(libname)
         xkb.xkb_context_new.restype = ctypes.c_void_p
@@ -426,37 +462,48 @@ def validate_keymap(identifier, variant_name, paths=None):
             ctypes.c_void_p, ctypes.POINTER(_Names), ctypes.c_int]
         xkb.xkb_keymap_unref.argtypes = [ctypes.c_void_p]
 
-        context = xkb.xkb_context_new(0)
-        names = _Names(b'evdev', b'pc105', identifier.encode(),
-                       variant_name.encode(), None)
-        keymap = xkb.xkb_keymap_new_from_names(context, ctypes.byref(names), 0)
+        def _compile():
+            context = xkb.xkb_context_new(0)
+            names = _Names(b'evdev', b'pc105', identifier.encode(),
+                           variant_name.encode(), None)
+            return xkb.xkb_keymap_new_from_names(
+                context, ctypes.byref(names), 0)
+
+        keymap, diagnostics = _call_with_fd2_captured(_compile)
         if keymap:
             xkb.xkb_keymap_unref(keymap)
-            return True, ''
+            return True, '', diagnostics
         return False, ('libxkbcommon could not assemble keymap for %s(%s)'
-                       % (identifier, variant_name))
+                       % (identifier, variant_name)), diagnostics
     except Exception as error:
-        return True, 'validation error: %s' % error      # never block on a probe bug
+        # never block on a probe bug
+        return True, 'validation error: %s' % error, ''
 
 
 def validate_installed(records, paths=None):
     """Validate every variant of every record against the on-disk tree.
 
-    Returns (ok, failures) with failures a list of (identifier, variant, message).
+    Returns (ok, failures, diagnostics): failures is a list of (identifier,
+    variant, message); diagnostics is a list of (identifier, variant, text)
+    for every compile whose C-side output was non-empty, success or not.
     Call AFTER the files are written (the keymap is assembled from them) and
     BEFORE reporting success.
     """
 
     paths = paths or InstallPaths()
     failures = []
+    diagnostics = []
     for record in records:
         base = k2x_base_name(record.get('base_layout') or 'us')
         for variant_name, _text in record['variants']:
             # Compile the way it is actually selected: <base>-k2x(mac-k2x-variant).
-            ok, message = validate_keymap(base, variant_name, paths)
+            ok, message, noise = validate_keymap(base, variant_name, paths)
+            if noise.strip():
+                diagnostics.append(
+                    (record['identifier'], variant_name, noise.strip()))
             if not ok:
                 failures.append((record['identifier'], variant_name, message))
-    return (not failures), failures
+    return (not failures), failures, diagnostics
 
 
 def _snapshot_files(paths):
@@ -524,12 +571,13 @@ def install_records(new_records, paths=None, force=False, validate=True,
               'refreshed': refreshed,
               'all_unchanged': all(v == 'unchanged' for v in status.values()),
               'installed_count': len(merged), 'validated': False,
-              'rolled_back': False, 'failures': []}
+              'rolled_back': False, 'failures': [], 'diagnostics': []}
 
     if validate:
-        ok, failures = validate_installed(new_records, paths)
+        ok, failures, diagnostics = validate_installed(new_records, paths)
         result['validated'] = ok
         result['failures'] = failures
+        result['diagnostics'] = diagnostics
         if not ok:
             # The assembled keymap did not compile -- undo everything.
             _restore_files(snapshot)

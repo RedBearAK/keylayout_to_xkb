@@ -25,7 +25,7 @@ from keylayout_to_xkb.common.debug import warn
 from keylayout_to_xkb.install.catalog import LayoutRecord
 
 
-__version__ = '20260704b'
+__version__ = '20260704c'
 
 
 def _record_to_dict(record: LayoutRecord) -> 'dict':
@@ -214,8 +214,13 @@ def _print_preview(ident):
     return 0
 
 
-def _report_lines(report):
-    """The install report as a list of lines (shared by print, pager, log)."""
+def _report_lines(report, full=False):
+    """The install report as a list of lines (shared by print, pager, log).
+
+    full=False (the screen) summarizes compile diagnostics in one line;
+    full=True (the log file) includes every captured diagnostic body, so
+    libxkbcommon's fd-2 output finally survives the alternate screen.
+    """
 
     lines = []
     if report.get('rolled_back'):
@@ -228,6 +233,7 @@ def _report_lines(report):
             lines.append('  %s (%s): %s' % (identifier, variant, message))
         lines.append('')
         lines.append('Your existing keyboard configuration is untouched.')
+        lines.extend(_diagnostics_lines(report, full))
         return lines
     if report['all_unchanged']:
         lines.append('Already up to date (nothing changed); no need to '
@@ -238,6 +244,28 @@ def _report_lines(report):
     if report['refreshed']:
         lines.append('Refreshed: %s' % ', '.join(report['refreshed']))
     lines.append('Files written under %s' % report['paths'].root)
+    lines.extend(_diagnostics_lines(report, full))
+    return lines
+
+
+def _diagnostics_lines(report, full):
+    """Captured libxkbcommon compile diagnostics, summarized or in full."""
+
+    diagnostics = report.get('diagnostics') or []
+    if not diagnostics:
+        return []
+    lines = ['']
+    if not full:
+        lines.append('%d compile(s) produced libxkbcommon diagnostics; '
+                     'full text is in the log file.' % len(diagnostics))
+        return lines
+    lines.append('libxkbcommon compile diagnostics (%d):'
+                 % len(diagnostics))
+    for identifier, variant, text in diagnostics:
+        lines.append('')
+        lines.append('--- %s (%s) ---' % (identifier, variant))
+        for row in text.splitlines():
+            lines.append('  ' + row)
     return lines
 
 
@@ -261,7 +289,7 @@ def _write_report_log(lines):
 
 def _report(report, pager=False):
     lines = _report_lines(report)
-    log_path = _write_report_log(lines)
+    log_path = _write_report_log(_report_lines(report, full=True))
     if log_path is not None:
         lines.append('')
         lines.append('Full report saved: %s' % log_path)
