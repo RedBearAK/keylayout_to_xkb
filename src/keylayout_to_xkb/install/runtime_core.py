@@ -18,13 +18,14 @@ and can never disturb other layouts or system/user files.
 """
 
 import os
+import re
 import sys
 import json
 
 from xml.sax.saxutils import escape as _xml_escape
 
 
-__version__ = '20260704b'
+__version__ = '20260704c'
 
 
 _NAMESPACE = 'keylayout_to_xkb'
@@ -806,6 +807,74 @@ def system_remove():
             os.remove(target)
             result['removed'].append(name)
     if os.path.isdir(SYSTEM_MANIFEST_DIR):
+        try:
+            os.remove(SYSTEM_MANIFEST_FILE)
+            os.rmdir(SYSTEM_MANIFEST_DIR)
+        except OSError:
+            pass
+    return result
+
+
+# Matches our per-record section names inside a symbols file; group(1) is
+# the record identifier. Kept as a module-global _rgx per project convention.
+_SECTION_ID_RGX = re.compile(r'xkb_symbols "mac-k2x-([a-z0-9]+)-(?:ansi|iso)"')
+
+
+def system_installed_identifiers():
+    """Map each present system symbols file to the layout identifiers whose
+    sections it contains, parsed from the section names themselves (possible
+    since names carry the record identifier). Returns {file_name: sorted ids}.
+    """
+
+    occupancy = {}
+    for name, present in system_installed():
+        if not present:
+            continue
+        content = _read(os.path.join(SYSTEM_SYMBOLS_DIR, name))
+        if not content:
+            continue
+        ids = sorted(set(_SECTION_ID_RGX.findall(content)))
+        if ids:
+            occupancy[name] = ids
+    return occupancy
+
+
+def system_remove_files(names):
+    """Remove SPECIFIC manifest-listed system files (run as root).
+
+    The scoped sibling of system_remove, for when a base file's last layout
+    is uninstalled. Same safety rules: only manifest-listed names, only
+    files carrying the managed-region marker. Returns
+    {'removed': [...], 'skipped': [...]}.
+    """
+
+    manifest = _load_system_manifest()
+    result = {'removed': [], 'skipped': []}
+    for name in names:
+        if name not in manifest['files']:
+            result['skipped'].append('%s (not in system manifest)' % name)
+            continue
+        full = os.path.join(SYSTEM_SYMBOLS_DIR, name)
+        content = _read(full)
+        if content is None:
+            del manifest['files'][name]
+            result['skipped'].append('%s (already absent)' % name)
+            continue
+        if _BEGIN not in content:
+            result['skipped'].append('%s (no marker; left alone)' % name)
+            continue
+        try:
+            os.remove(full)
+            del manifest['files'][name]
+            result['removed'].append(name)
+        except OSError as error:
+            result['skipped'].append('%s (%s)' % (name, error))
+    if manifest['files']:
+        os.makedirs(SYSTEM_MANIFEST_DIR, exist_ok=True)
+        with open(SYSTEM_MANIFEST_FILE, 'w', encoding='utf-8') as handle:
+            json.dump(manifest, handle, indent=2, ensure_ascii=False)
+    else:
+        # last managed file gone: clear the manifest like system_remove does
         try:
             os.remove(SYSTEM_MANIFEST_FILE)
             os.rmdir(SYSTEM_MANIFEST_DIR)

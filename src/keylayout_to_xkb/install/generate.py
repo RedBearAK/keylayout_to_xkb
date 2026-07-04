@@ -25,7 +25,7 @@ from keylayout_to_xkb.common.debug import warn
 from keylayout_to_xkb.install.catalog import LayoutRecord
 
 
-__version__ = '20260704c'
+__version__ = '20260704d'
 
 
 def _record_to_dict(record: LayoutRecord) -> 'dict':
@@ -155,6 +155,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import json
 import zlib
@@ -384,6 +385,15 @@ def main(argv):
             print('system: FAILED and rolled back: %s' % result['error'])
             return 1
         return 0 if not result['refused'] else 1
+    if cmd == '--system-remove-files' and len(argv) > 1:
+        _require_linux()
+        _require_root(cmd)
+        result = system_remove_files(argv[1:])
+        for name in result['removed']:
+            print('system: removed symbols/%s' % name)
+        for line in result['skipped']:
+            print('system: skipped %s' % line)
+        return 0
     if cmd == '--system-remove':
         _require_linux()
         _require_root(cmd)
@@ -444,9 +454,19 @@ def main(argv):
         _refuse_root()
         result = uninstall_one(argv[1], force=force)
         if result['removed'] is None:
-            print('not installed: %s' % argv[1]); return 1
-        print('Removed %s (%d remain). Some desktops might need a log out.'
-              % (result['removed'], result['installed_count'])); return 0
+            in_system = any(
+                argv[1] in ids
+                for ids in system_installed_identifiers().values())
+            if not in_system:
+                print('not installed: %s' % argv[1]); return 1
+            print('%s is not user-installed, but has system copies.'
+                  % argv[1])
+        else:
+            print('Removed %s (%d remain). Some desktops might need a '
+                  'log out.'
+                  % (result['removed'], result['installed_count']))
+        _system_sync_after_uninstall([argv[1]])
+        return 0
     if cmd == '--uninstall-all':
         _require_linux()
         _refuse_root()
@@ -455,7 +475,12 @@ def main(argv):
             print('Removed: %s' % ', '.join(result['removed']))
             print('Some Linux desktops might need a log out.')
         else:
-            print('Nothing installed; nothing to remove.')
+            print('Nothing user-installed; nothing to remove there.')
+        if system_installed():
+            answer = _ask(
+                'Also remove the system-location files? [Y/n] ')
+            if answer.strip().lower() not in ('n', 'no'):
+                _escalate_run(['--system-remove'])
         return 0
 
     print(__doc__)
@@ -538,7 +563,7 @@ def _ask(prompt):
 
     _drain_input()
     try:
-        return input(prompt).strip()
+        return input('\n' + prompt).strip()
     except (EOFError, KeyboardInterrupt):
         return ''
 
@@ -659,6 +684,64 @@ def _select_records():
         _pause()
 
 
+def _system_sync_after_uninstall(removed_ids, ask=True):
+    """Mirror an uninstall into the system tree (ask-first, default yes).
+
+    Finds every system base file whose parsed occupancy includes a removed
+    identifier, rebuilds it from the remaining occupants' records (staged,
+    then applied through the existing escalated verb), and removes base
+    files whose last occupant left (scoped root verb). No system copies of
+    the removed layouts means no questions and no escalation.
+    """
+
+    import shutil
+    import tempfile
+
+    occupancy = system_installed_identifiers()
+    removed = set(removed_ids)
+    rebuilds = {}
+    removals = []
+    for name, ids in occupancy.items():
+        if not removed.intersection(ids):
+            continue
+        remaining = [i for i in ids if i not in removed]
+        if remaining:
+            rebuilds[name] = remaining
+        else:
+            removals.append(name)
+    if not rebuilds and not removals:
+        return
+
+    if ask:
+        answer = _ask('Also remove from the system location? [Y/n] ')
+        if answer.strip().lower() in ('n', 'no'):
+            print('System copies left in place.')
+            return
+
+    if rebuilds:
+        keep_ids = set()
+        for ids in rebuilds.values():
+            keep_ids.update(ids)
+        keep_records = [r for r in RECORDS if r['identifier'] in keep_ids]
+        staged_dir = tempfile.mkdtemp(prefix='kl2xkb-sync-')
+        try:
+            # build_symbols_files keys by BASE ('us'); the system tree
+            # holds the namespaced file names ('usx'), so stage under those.
+            for name, content in build_symbols_files(keep_records).items():
+                with open(os.path.join(staged_dir, k2x_base_name(name)),
+                          'w', encoding='utf-8') as handle:
+                    handle.write(content)
+            code = _escalate_run(['--system-apply', staged_dir])
+            if code not in (0,):
+                print('System rebuild did not complete (code %r).' % code)
+        finally:
+            shutil.rmtree(staged_dir, ignore_errors=True)
+    if removals:
+        code = _escalate_run(['--system-remove-files'] + sorted(removals))
+        if code not in (0,):
+            print('System file removal did not complete (code %r).' % code)
+
+
 def _escalate_run(extra_args):
     """Run this installer with 'extra_args' through the first available
     privilege-escalation tool (Toshy convention: sudo, doas, run0, sudo-rs).
@@ -674,6 +757,7 @@ def _escalate_run(extra_args):
     for tool in ('sudo', 'doas', 'run0', 'sudo-rs'):
         if shutil.which(tool):
             print('Escalating with %s for the system-location step...' % tool)
+            print('', flush=True)
             return subprocess.call([tool] + command_tail)
     print('No escalation tool found (looked for sudo, doas, run0, sudo-rs).')
     print('Run this yourself as root, then re-run the installer:')
@@ -883,29 +967,41 @@ def _menu(force=False):
 
 
 def _manage_flow(force=False):
-    """Show installed layouts and offer to uninstall one or all."""
+    """List everything installed anywhere with location markers, and offer
+    to uninstall one layout or all of them -- user and system trees linked:
+    removing a layout removes its sections regardless of location (asking
+    once before the escalated system step)."""
 
     installed = list_installed()
-    system_files = system_installed()
+    user_ids = set(record['identifier'] for record in installed)
+    occupancy = system_installed_identifiers()
+    sys_ids = set()
+    for ids in occupancy.values():
+        sys_ids.update(ids)
+    display_names = dict(
+        (record['identifier'], record['display_name']) for record in RECORDS)
+    for record in installed:
+        display_names[record['identifier']] = record['display_name']
+
     _clear()
     print('Manage installed layouts')
     print('=' * 40)
-    if not installed and not system_files:
+    all_ids = sorted(user_ids | sys_ids)
+    if not all_ids:
         print('Nothing is installed.')
         _pause()
         return
-    ordered = sorted(installed, key=lambda r: r['identifier'])
     listing = []
-    for index, record in enumerate(ordered, start=1):
-        listing.append('  %2d) %-18s %s)'
-                       % (index, record['identifier'], record['display_name']))
-    if system_files:
-        listing.append('')
-        listing.append(
-            'System-location symbols files (need admin rights to remove):')
-        for name, present in system_files:
-            listing.append('     symbols/%s%s'
-                           % (name, '' if present else ' (missing)'))
+    for index, identifier in enumerate(all_ids, start=1):
+        if identifier in user_ids and identifier in sys_ids:
+            marker = '(user+sys)'
+        elif identifier in user_ids:
+            marker = '(user)'
+        else:
+            marker = '(sys)'
+        listing.append('  %3d) %-20s %-10s %s)'
+                       % (index, identifier, marker,
+                          display_names.get(identifier, identifier)))
     if len(listing) > 20:
         _page('\n'.join(listing))
         print('(the full list is in the pager above; scroll with it)')
@@ -913,49 +1009,49 @@ def _manage_flow(force=False):
         for line in listing:
             print(line)
     print('')
-    print('Enter a number to uninstall that layout, "all" to remove every')
-    if system_files:
-        print('kl2xkb layout, "sys" to remove the system-location symbols')
-        print('files (escalates), or blank to go back.')
-    else:
-        print('kl2xkb layout, or blank to go back.')
+    print('Enter a number to uninstall that layout (from BOTH locations,')
+    print('asked before the system step), "all" to remove everything, or')
+    print('blank to go back.')
     answer = _ask('> ').strip().lower()
 
     if not answer:
         return
-    if answer == 'sys' and system_files:
-        confirm = _ask('Remove %d system symbols file(s)? [y/N] '
-                       % len(system_files))
-        if confirm.lower() in ('y', 'yes'):
-            code = _escalate_run(['--system-remove'])
-            _clear()
-            if code == 0:
-                print('System-location symbols removed.')
-            else:
-                print('System removal did not complete.')
-            _pause()
-        return
     if answer == 'all':
-        confirm = _ask('Remove ALL %d installed layout(s)? [y/N] ' % len(ordered))
+        confirm = _ask('Remove ALL %d installed layout(s)? [y/N] '
+                       % len(all_ids))
         if confirm.lower() in ('y', 'yes'):
             result = uninstall_all()
             _clear()
-            print('Removed: %s' % ', '.join(result['removed']))
-            print('\nSome Linux desktops might need a log out to update the picker.')
+            if result['removed']:
+                print('Removed: %s' % ', '.join(result['removed']))
+            if system_installed():
+                sys_answer = _ask(
+                    'Also remove the system-location files? [Y/n] ')
+                if sys_answer.strip().lower() not in ('n', 'no'):
+                    code = _escalate_run(['--system-remove'])
+                    if code == 0:
+                        print('System-location files removed.')
+                    else:
+                        print('System removal did not complete.')
+            print('\nSome Linux desktops might need a log out to update '
+                  'the picker.')
         else:
             _clear()
             print('Cancelled.')
         _pause()
         return
-    if answer.isdigit() and 1 <= int(answer) <= len(ordered):
-        record = ordered[int(answer) - 1]
-        confirm = _ask('Uninstall %s? [y/N] ' % record['identifier'])
+    if answer.isdigit() and 1 <= int(answer) <= len(all_ids):
+        identifier = all_ids[int(answer) - 1]
+        confirm = _ask('Uninstall %s? [y/N] ' % identifier)
         if confirm.lower() in ('y', 'yes'):
-            result = uninstall_one(record['identifier'], force=force)
             _clear()
-            print('Removed %s (%d remain).'
-                  % (result['removed'], result['installed_count']))
-            print('\nSome Linux desktops might need a log out to update the picker.')
+            if identifier in user_ids:
+                result = uninstall_one(identifier, force=force)
+                print('Removed %s (%d remain in the user tree).'
+                      % (result['removed'], result['installed_count']))
+            _system_sync_after_uninstall([identifier])
+            print('\nSome Linux desktops might need a log out to update '
+                  'the picker.')
         else:
             _clear()
             print('Cancelled.')

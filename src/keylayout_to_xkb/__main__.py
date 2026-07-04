@@ -33,6 +33,7 @@ appendix counts were hand-tallied).
 
 import os
 import sys
+import time
 import argparse
 
 from keylayout_to_xkb.common.debug import set_debug, dbg, warn
@@ -234,16 +235,19 @@ def _versioned_dir(path):
 def _resolve_installer_filename(given, layout_count=0):
     """Resolve the bundled single-file installer path.
 
-    given is None/'' (auto-name) or a user string. Auto: a count-based name,
-    'install_xkb_layouts_<N>.py' -- deliberately generic (no filter or language
-    hints; the count is the one honest summary of any selection). User-supplied: sanitized strictest, .py
+    given is None/'' (auto-name) or a user string. Auto: a count-plus-
+    timestamp name, 'install_<N>_xkb_layouts_<YYYYMMDD_HHMMSS>.py' --
+    deliberately generic (no filter or language hints; the deduped count is
+    the one honest summary of any selection, and the timestamp tells builds
+    apart). User-supplied: sanitized strictest, .py
     enforced, NO forced install_ prefix or _kl2xkb suffix (those are only for
     auto-named files). If sanitization changed a user name, confirm it (or use
     it silently when no TTY). Returns the path, or None to abort.
     """
 
     if not given:
-        return 'install_xkb_layouts_%d.py' % layout_count
+        return 'install_%d_xkb_layouts_%s.py' % (
+            layout_count, time.strftime('%Y%m%d_%H%M%S'))
 
     # Preserve any directory the user gave; sanitize only the filename part.
     directory = os.path.dirname(given)
@@ -548,6 +552,22 @@ def main(argv: 'list[str] | None' = None) -> int:
     )
 
     if args.make_installer is not None:
+        # Dedupe literal duplicates: the macOS catalog carries two entries
+        # apiece for a couple of layouts (the Wubihua pair), which collapse
+        # to one identifier and would otherwise self-refresh during install
+        # and inflate every count. Keep the first, warn loudly.
+        seen_ids = {}
+        deduped = []
+        for record in built_records:
+            ident = record.identifier
+            if ident in seen_ids:
+                warn('main', 'duplicate layout identifier %r (keeping the '
+                     'first occurrence, dropping this one)' % ident)
+                continue
+            seen_ids[ident] = True
+            deduped.append(record)
+        built_records = deduped
+
         if not built_records:
             warn('main', 'no layouts matched; nothing to put in the installer')
             return 1

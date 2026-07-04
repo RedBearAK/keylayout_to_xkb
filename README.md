@@ -48,7 +48,9 @@ characters — what every cell, composition, and chain sequence should
 produce, and compares the tool's model against those answers. As of
 2026-07-04 the full catalog audit reports 100% agreement across all 241
 layouts shipped with macOS: roughly 150,000 machine-verified claims, zero
-divergences. A wrong character on Linux therefore points at emission or
+divergences. (Two of those 241 catalog entries are literal duplicates --
+the Wubihua pair -- so an installer built from the full catalog carries
+239 unique layouts, and says so in its name.) A wrong character on Linux therefore points at emission or
 installation, never at a misread layout. The gory details, including every
 wrong turn taken on the way, live in `docs/UCHR_FORMAT_HANDOFF.md`.
 
@@ -134,4 +136,3 @@ pipeline stage:
   still emits.
 * Compositions reachable only through command-modifier planes on macOS are
   outside the emitted eight-plane surface and are correctly absent.
-
