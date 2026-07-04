@@ -22,7 +22,7 @@ from keylayout_to_xkb.emit.classify import dead_state_keysym
 from keylayout_to_xkb.install.catalog import LayoutRecord, derive_language
 
 
-__version__ = '20260623'
+__version__ = '20260704'
 
 
 def _identifier_from(layout: Layout) -> str:
@@ -118,7 +118,15 @@ def build_record(layout: Layout) -> LayoutRecord:
         layout.provenance.source_id if layout.provenance else '',
     )
 
-    variants = emit_symbols_variants(layout, 'mac-k2x', display_stem)
+    # Variant section names carry the record identifier so that several
+    # layouts sharing one language (and therefore one <base>x symbols file)
+    # never collide: XKB resolves a variant reference to the FIRST section
+    # with that name, so bare 'mac-k2x-ansi' names made every multi-layout
+    # group silently serve its alphabetically-first record's tables. The
+    # 'mac-k2x-' prefix stays: it marks the variant as a Mac layout from
+    # this tool wherever the raw name appears.
+    variants = emit_symbols_variants(
+        layout, 'mac-k2x-%s' % identifier, display_stem)
 
     note = ''
     if layout.provenance is not None and layout.provenance.source_id:

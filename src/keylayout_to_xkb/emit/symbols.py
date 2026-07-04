@@ -63,7 +63,7 @@ from keylayout_to_xkb.emit.classify import (
 )
 
 
-__version__ = '20260702b'
+__version__ = '20260704'
 
 
 # Planes in canonical level order, each with the XKB modifier-combination tokens
@@ -110,8 +110,8 @@ _VK_TO_XKB = {
 }
 
 
-def _cell_token(layout: Layout, virtual_key: int, plane: ModifierState,
-                placeholders: 'dict') -> 'str | None':
+def _cell_token(layout: Layout, keys: 'dict', virtual_key: int,
+                plane: ModifierState, placeholders: 'dict') -> 'str | None':
     """XKB keysym token for one cell, or None if the cell is absent.
 
     DEAD -> its named dead_* keysym if the diacritic has one, else the dead-state
@@ -122,7 +122,7 @@ def _cell_token(layout: Layout, virtual_key: int, plane: ModifierState,
     only when there is genuinely no output for the cell.
     """
 
-    key_output = layout.keys.get(virtual_key, {}).get(plane)
+    key_output = keys.get(virtual_key, {}).get(plane)
     if key_output is None:
         return None
     if key_output.kind is OutputKind.DEAD:
@@ -178,7 +178,8 @@ def _standard_type_for(max_level: int) -> str:
     return _STANDARD_TYPE[8]
 
 
-def _padded_tokens(layout: Layout, virtual_key: int, placeholders: 'dict') -> 'tuple':
+def _padded_tokens(layout: Layout, keys: 'dict', virtual_key: int,
+                   placeholders: 'dict') -> 'tuple':
     """Build a key's level tokens padded to a contiguous 1..max_level list.
 
     The plane->level order is fixed (plain=1, shift=2, option=3, shift+option=4,
@@ -190,7 +191,7 @@ def _padded_tokens(layout: Layout, virtual_key: int, placeholders: 'dict') -> 't
     # Map each present plane to its fixed level index (1-based) and token.
     level_token = {}
     for plane, _mods in _PLANE_LEVEL_ORDER:
-        token = _cell_token(layout, virtual_key, plane, placeholders)
+        token = _cell_token(layout, keys, virtual_key, plane, placeholders)
         if token is not None:
             level_token[_PLANE_INDEX[plane] + 1] = token
 
@@ -201,7 +202,8 @@ def _padded_tokens(layout: Layout, virtual_key: int, placeholders: 'dict') -> 't
     return tokens, max_level
 
 
-def _build_key_groups(layout: Layout, plane_tables: 'dict') -> 'tuple':
+def _build_key_groups(layout: Layout, keys: 'dict',
+                      plane_tables: 'dict') -> 'tuple':
     """Build the per-key standard-type assignment and padded symbol rows.
 
     Returns (types, key_rows):
@@ -215,9 +217,10 @@ def _build_key_groups(layout: Layout, plane_tables: 'dict') -> 'tuple':
 
     key_rows = {}
     for virtual_key, xkb_code in _VK_TO_XKB.items():
-        if virtual_key not in layout.keys:
+        if virtual_key not in keys:
             continue
-        tokens, max_level = _padded_tokens(layout, virtual_key, placeholders)
+        tokens, max_level = _padded_tokens(layout, keys, virtual_key,
+                                           placeholders)
         if not tokens:
             continue
         type_name = _standard_type_for(max_level)
@@ -357,17 +360,48 @@ def emit_symbols(layout: Layout, variant_name: str, display_name: str) -> str:
     """Emit a complete xkb_types + xkb_symbols block for one layout."""
 
     plane_tables = _variant_plane_tables(layout)
-    types, key_rows = _build_key_groups(layout, plane_tables)
+    types, key_rows = _build_key_groups(layout, layout.keys, plane_tables)
     return _render_layout(types, key_rows, variant_name, display_name)
+
+
+def _kind_keys(layout: Layout, tag: str) -> 'dict':
+    """The key tables macOS uses on hardware of the given kind.
+
+    Layouts that carry keyboard-type variant tables (the PC family) expose
+    them as Variant entries tagged 'ansi'/'iso'/'jis'; absence of a tag
+    means the OS resolves that hardware kind to the primary tables, so
+    falling back to layout.keys is correct BY CONSTRUCTION, not merely
+    convenient. Every layout without kind tables therefore emits exactly
+    what it always did.
+    """
+
+    for variant in layout.variants or []:
+        if variant.tag == tag and variant.keys:
+            return variant.keys
+    return layout.keys
 
 
 def emit_symbols_variants(layout: Layout, base_identifier: str,
                           base_display: str) -> 'list[tuple[str, str]]':
-    """Emit both the ANSI and ISO Macintosh variants for a layout."""
+    """Emit both the ANSI and ISO Macintosh variants for a layout.
+
+    Each variant carries the key tables macOS uses on that hardware kind
+    (see _kind_keys) -- the '-ansi' variant of Russian - PC really types
+    the Cyrillic io on the backquote key, as a Mac with an ANSI keyboard
+    does. The ISO variant additionally swaps <TLDE>/<LSGT>, because Apple
+    ISO keyboards permute those two scancodes. JIS kind tables are not
+    emitted: Linux JIS setups use the jp layout family.
+    """
 
     plane_tables = _variant_plane_tables(layout)
-    types, key_rows = _build_key_groups(layout, plane_tables)
-    iso_rows = _swap_iso_keys(key_rows)
+    ansi_keys = _kind_keys(layout, 'ansi')
+    iso_keys = _kind_keys(layout, 'iso')
+    types, key_rows = _build_key_groups(layout, ansi_keys, plane_tables)
+    if iso_keys is ansi_keys:
+        iso_base = key_rows
+    else:
+        _types, iso_base = _build_key_groups(layout, iso_keys, plane_tables)
+    iso_rows = _swap_iso_keys(iso_base)
 
     ansi_name = '%s-ansi' % base_identifier
     iso_name = '%s-iso' % base_identifier

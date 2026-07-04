@@ -352,7 +352,43 @@ evidence. Membership changes now require a fresh full-coverage run. (The
 same batch fixed a FourCC mis-transcription: 194 is JIS, caught by the
 decoded rerun of the dump probe.)
 
-### 5.9 Probe-side artifacts masquerading as divergences
+### 5.9 The variant-name collision (every multi-layout language served
+the wrong layout)
+
+Emission named every record's XKB variant sections with the same constant
+stem: 'mac-k2x-ansi' / 'mac-k2x-iso', passed as a literal at the
+build_record call site. Harmless for a language with one layout -- and
+catastrophically silent for every language with several, because all of a
+language's layouts share one <base>x symbols file, and XKB resolves a
+variant reference to the FIRST section bearing that name. Records are
+grouped sorted by identifier, so selecting 'Polish Pro (Macintosh, ANSI)'
+in KDE loaded plain Polish's tables ('polish' < 'polishpro'), Russian - PC
+loaded Russian's, and so on across the Arabics, Tibetans, Kabyles, and
+Zhuyins. The duplicate section names are also the prime suspect for the
+keymap-compile failures seen during the first full-catalog install.
+
+Why it survived so long: every test until the full-catalog install used
+single layouts or layouts from different languages -- the collision needs
+two same-language records in one file to exist at all, and a NAME
+collision produces no parse error, no compile diff on the first record,
+and no wrong character anywhere except under the OTHER records' labels.
+The fix names sections 'mac-k2x-<identifier>-<kind>' (prefix retained so a
+raw variant name is recognizably a Mac layout from this tool). Lesson: any
+constant passed where per-record identity belongs is a collision waiting
+for the first shared namespace; and full-catalog testing exercises sharing
+that spot checks structurally cannot.
+
+The same investigation exposed a second, adjacent gap, now closed: the
+emitted ANSI/ISO variants were physical-shape swaps of the primary tables
+only, while the oracle-certified keyboard-type kind tables (Variant tag
+'ansi'/'iso' -- the tables that make Russian - PC type Cyrillic io on an
+ANSI backquote) were never wired into emission, despite models.py
+documenting that intent. Variants now carry their kind's tables, falling
+back to the primary when a layout has no table set for that kind -- which
+is correct by construction, since an absent tag means the OS resolves
+that hardware kind to the primary tables.
+
+### 5.10 Probe-side artifacts masquerading as divergences
 
 Three separate rounds: the tie-settling running blind inside a probe that
 predated its kwargs; the probe pressing literal twin cells instead of

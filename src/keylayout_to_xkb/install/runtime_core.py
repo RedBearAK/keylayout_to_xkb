@@ -23,7 +23,7 @@ import json
 from xml.sax.saxutils import escape as _xml_escape
 
 
-__version__ = '20260703'
+__version__ = '20260704'
 
 
 _NAMESPACE = 'keylayout_to_xkb'
@@ -76,6 +76,10 @@ def k2x_base_name(base_layout):
     rules -- so the compositor cannot resolve our types component and every key
     collapses to level 1 (Shift/AltGr/CapsLock stop working). 'plx' is short
     enough to survive the clip while staying distinct from the system 'pl'.
+    Three-letter language codes ('ara') make FOUR-letter names ('arax');
+    that is inside proven territory, since the truncation victim was the
+    DASH form and the system itself ships the five-letter 'latam' working
+    everywhere in KDE.
     """
 
     return '%sx' % (base_layout or 'us')

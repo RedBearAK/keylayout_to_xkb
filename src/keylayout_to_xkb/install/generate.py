@@ -25,7 +25,7 @@ from keylayout_to_xkb.common.debug import warn
 from keylayout_to_xkb.install.catalog import LayoutRecord
 
 
-__version__ = '20260704'
+__version__ = '20260704b'
 
 
 def _record_to_dict(record: LayoutRecord) -> 'dict':
@@ -214,25 +214,62 @@ def _print_preview(ident):
     return 0
 
 
-def _report(report):
+def _report_lines(report):
+    """The install report as a list of lines (shared by print, pager, log)."""
+
+    lines = []
     if report.get('rolled_back'):
-        print('INSTALL FAILED -- rolled back; nothing was changed.')
-        print('')
-        print('The assembled keymap did not compile, so the install was undone')
-        print('to protect your session. Affected layout(s):')
+        lines.append('INSTALL FAILED -- rolled back; nothing was changed.')
+        lines.append('')
+        lines.append('The assembled keymap did not compile, so the install '
+                     'was undone')
+        lines.append('to protect your session. Affected layout(s):')
         for identifier, variant, message in report.get('failures', []):
-            print('  %s (%s): %s' % (identifier, variant, message))
-        print('')
-        print('Your existing keyboard configuration is untouched.')
-        return
+            lines.append('  %s (%s): %s' % (identifier, variant, message))
+        lines.append('')
+        lines.append('Your existing keyboard configuration is untouched.')
+        return lines
     if report['all_unchanged']:
-        print('Already up to date (nothing changed); no need to log out.')
-        return
+        lines.append('Already up to date (nothing changed); no need to '
+                     'log out.')
+        return lines
     if report['added']:
-        print('Installed: %s' % ', '.join(report['added']))
+        lines.append('Installed: %s' % ', '.join(report['added']))
     if report['refreshed']:
-        print('Refreshed: %s' % ', '.join(report['refreshed']))
-    print('Files written under %s' % report['paths'].root)
+        lines.append('Refreshed: %s' % ', '.join(report['refreshed']))
+    lines.append('Files written under %s' % report['paths'].root)
+    return lines
+
+
+def _write_report_log(lines):
+    """Persist the report so it survives the alternate screen. Returns the
+    log path, or None when writing was not possible (never fatal)."""
+
+    state_dir = os.path.join(
+        os.environ.get('XDG_STATE_HOME')
+        or os.path.expanduser('~/.local/state'), 'kl2xkb')
+    try:
+        os.makedirs(state_dir, exist_ok=True)
+        stamp = __import__('time').strftime('%Y%m%d_%H%M%S')
+        path = os.path.join(state_dir, 'install_report_%s.log' % stamp)
+        with open(path, 'w', encoding='utf-8') as handle:
+            handle.write('\n'.join(lines) + '\n')
+        return path
+    except OSError:
+        return None
+
+
+def _report(report, pager=False):
+    lines = _report_lines(report)
+    log_path = _write_report_log(lines)
+    if log_path is not None:
+        lines.append('')
+        lines.append('Full report saved: %s' % log_path)
+    if pager and len(lines) > 20:
+        _page('\n'.join(lines))
+        return
+    for line in lines:
+        print(line)
     print('')
     print('Some Linux desktop environments might require a log out to allow')
     print('picking the new layout(s).')
@@ -423,9 +460,29 @@ def _clear():
         sys.stdout.flush()
 
 
+def _drain_input():
+    """Discard pending terminal input before prompting.
+
+    Mouse-wheel scrolling in the alternate screen makes many terminals emit
+    arrow-key escape sequences; without a drain those land verbatim in the
+    next input() and corrupt the answer. termios is a lazy import: the TUI
+    only runs on Linux, but this module's inspection verbs must import
+    everywhere.
+    """
+
+    if not sys.stdin.isatty():
+        return
+    try:
+        import termios
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except (ImportError, OSError):
+        pass
+
+
 def _pause(message='Press Enter to continue...'):
     """Wait for the user before leaving a screen (so output is readable)."""
 
+    _drain_input()
     try:
         input('\n' + message)
     except (EOFError, KeyboardInterrupt):
@@ -451,6 +508,7 @@ def _ask(prompt):
     """Prompt for a line of input. Returns '' on EOF/Ctrl-C so callers treat it
     as 'go back' rather than crashing."""
 
+    _drain_input()
     try:
         return input(prompt).strip()
     except (EOFError, KeyboardInterrupt):
@@ -622,7 +680,7 @@ def _system_install_records(records, force=False):
                                  force=True)
         if report.get('validation') == 'failed':
             print('Pre-validation FAILED; nothing was installed anywhere:')
-            _report(report)
+            _report(report, pager=True)
             return 1
     finally:
         shutil.rmtree(check_root, ignore_errors=True)
@@ -646,7 +704,7 @@ def _system_install_records(records, force=False):
             return code
 
         report = install_records(records, force=force, write_symbols=False)
-        _report(report)
+        _report(report, pager=True)
         print('')
         print('Symbols are in the system location: the keyboard preview and')
         print('Xorg sessions can use these layouts. Uninstalling later needs')
@@ -695,7 +753,7 @@ def _confirm_and_install(records, force=False):
     _clear()
     print('Installing to the user location (keyboard preview will not work).')
     report = install_records(records, force=force)
-    _report(report)
+    _report(report, pager=True)
     _pause()
 
 
@@ -809,14 +867,23 @@ def _manage_flow(force=False):
         _pause()
         return
     ordered = sorted(installed, key=lambda r: r['identifier'])
+    listing = []
     for index, record in enumerate(ordered, start=1):
-        print('  %2d) %-18s %s)'
-              % (index, record['identifier'], record['display_name']))
+        listing.append('  %2d) %-18s %s)'
+                       % (index, record['identifier'], record['display_name']))
     if system_files:
-        print('')
-        print('System-location symbols files (need admin rights to remove):')
+        listing.append('')
+        listing.append(
+            'System-location symbols files (need admin rights to remove):')
         for name, present in system_files:
-            print('     symbols/%s%s' % (name, '' if present else ' (missing)'))
+            listing.append('     symbols/%s%s'
+                           % (name, '' if present else ' (missing)'))
+    if len(listing) > 20:
+        _page('\n'.join(listing))
+        print('(the full list is in the pager above; scroll with it)')
+    else:
+        for line in listing:
+            print(line)
     print('')
     print('Enter a number to uninstall that layout, "all" to remove every')
     if system_files:
