@@ -32,6 +32,16 @@ u32 stateTerminatorsOffset, u32 sequenceDataOffset. Records may share table
 sets (dedupe by charIndexOffset); Russian – PC carries 27 records forming
 two sets, Arabic – AZERTY/PC 30 records with ranges as wide as 41-1300.
 
+Sub-table markers (the 0x_001 family, checked to fail loud on a bad offset)
+are, across the full shipped catalog, EXACTLY: 0x1002 header, 0x2001 feature
+info, 0x3001 modifier map, 0x4001 char index, 0x5001 state records, 0x6001
+terminators, 0x7001 sequences. This is the OBSERVED set, not a contiguous
+range: the values are not consecutive and none outside this set occurs. In
+particular 0x8001 is NOT a marker — 0x8000 is the sequence-index FLAG on a
+cell entry (section 1.5), not a table sentinel. Confirmed by the full-catalog
+structural walk (reverse_walk probe): no marker outside the seven above
+appears in any layout.
+
 ### 1.1 Keyboard-type resolution (which record the OS uses)
 
 The rule, probe-derived (probe_kbdtype_resolution and
@@ -141,8 +151,18 @@ u8 curStateRange, u8 deltaMultiplier, u16 charData, u16 nextState) — and
 NOTHING else: no sentinel, no nested block (section 5.3). charData 0xFFFF
 in a format-2 entry is a CHAIN: pressing this record's key in curState
 enters nextState (Tibetan stacking, depth ≤ 4 observed; the compose walk
-caps at 6 with a per-path cycle guard). curStateRange/deltaMultiplier are
-0/1 in every observed layout, but the expansion is implemented.
+caps at 6 with a per-path cycle guard). The WIDE run-expansion
+(curStateRange > 0 and/or deltaMultiplier > 1: charData advances by
+deltaMultiplier over curStateRange+1 states) IS exercised in the wild, but
+by exactly ONE layout — Unicode Hex Input, whose accumulator entries carry
+deltaMultiplier up to 16 and curStateRange up to 255 (sixteen hex digits,
+each advancing the accumulated codepoint by a fixed multiple). Every other
+layout, including the deep-chaining ones (Greek Polytonic, all three Tibetan
+layouts), uses only the degenerate 0/1-delta, 0-range form — one
+state→output pair per entry. Confirmed by a full-catalog structural walk
+(reverse_walk probe): 576 wide entries across the corpus, ALL in UHI, none
+elsewhere. This is why UHI's name-block (section 3) is load-bearing rather
+than cosmetic — see there.
 
 Entry semantics, all probe-proven:
 
@@ -218,7 +238,10 @@ cannot drift apart.
   deep, 65536 leaves). Blocked BY NAME per project decision — no shape
   heuristics; every other layout's chains are followed to the end. The
   emitted file carries an explanatory comment; the probe imports the same
-  constant.
+  constant. The block is LOAD-BEARING, not merely a convenience: UHI is the
+  ONLY layout that uses the wide format-2 run-expansion (section 1.6), so
+  quarantining it by name is what lets every other layout be decoded through
+  the degenerate-only path uniformly.
 * Control characters (\x03, \x14 classes) in plane cells are correctly
   unemitted; they appear as roundtrip "missing" rows, never mismatches.
 * Known cosmetic debt: the unused 'types' parameter in
