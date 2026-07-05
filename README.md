@@ -56,6 +56,8 @@ wrong turn taken on the way, live in `docs/UCHR_FORMAT_HANDOFF.md`.
 
 ## Quick start
 
+Requires Python 3.9 or newer (the floor declared in pyproject.toml).
+
 On the Mac (generate):
 
 ```

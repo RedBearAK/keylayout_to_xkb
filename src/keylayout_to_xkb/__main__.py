@@ -42,7 +42,7 @@ from keylayout_to_xkb.extract.tis_source import extract_all_layouts, TISExtracti
 from keylayout_to_xkb.extract.uchr_parse import parse_uchr, UchrParseError
 
 
-__version__ = '20260703'
+__version__ = '20260704'
 
 
 def _build_arg_parser() -> argparse.ArgumentParser:
@@ -88,6 +88,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         '--uchr-file',
         metavar='FILE',
         nargs='+',
+        # 'extend' flattens repeated flags into one list (--uchr-file A
+        # --uchr-file B); needs Python 3.8+, comfortably inside the
+        # declared >=3.9 floor in pyproject.toml.
+        action='extend',
         default=None,
         help='parse one or more local .uchr binaries instead of extracting from '
              'macOS (use with --make-installer to build from files off-Mac)',
