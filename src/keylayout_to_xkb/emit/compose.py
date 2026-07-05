@@ -31,6 +31,7 @@ rather than emitted wrong, so a bad base never silently corrupts the file.
 
 from keylayout_to_xkb.common.models import Layout
 from keylayout_to_xkb.common.debug import warn
+from keylayout_to_xkb.common.policy import layout_is_unicode_accumulator
 from keylayout_to_xkb.emit.classify import (
     char_to_keysym,
     dead_state_keysym,
@@ -63,15 +64,9 @@ def _codepoint_comment(text: str) -> str:
 # guards against a malformed cyclic graph ever looping the walk.
 _MAX_CHAIN_DEPTH = 6
 
-# Layouts whose chain graph is an intentional ALL-OF-UNICODE accumulator:
-# Unicode Hex Input encodes typing four hex digits as 16 transitions per
-# state, four deep -- 65536 leaf compositions whose XCompose expansion would
-# be megabytes of lines verifying nothing (Linux natively offers
-# Ctrl+Shift+U for the same job). Blocked BY NAME per project decision: no
-# shape heuristics; every other layout's chains are followed to the end.
-_CHAIN_BLOCKED_LAYOUTS = frozenset((
-    'unicode hex input',
-))
+# The all-of-Unicode accumulator list (Unicode Hex Input) lives in
+# common/policy.py so the reference-doc emitter shares the same decision;
+# see layout_is_unicode_accumulator.
 
 
 def _state_trigger(state_name, dead_state, placeholders):
@@ -223,7 +218,7 @@ def emit_compose(layout: Layout, header_note: str = '') -> str:
                             _codepoint_comment(dead_state.terminator)))
             total += 1
 
-        if (layout.name or '').strip().lower() in _CHAIN_BLOCKED_LAYOUTS:
+        if layout_is_unicode_accumulator(layout):
             lines.append('# chain expansion intentionally skipped for this '
                          'layout (all-of-Unicode accumulator)')
         else:

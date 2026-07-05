@@ -35,6 +35,7 @@ symbols/compose emitters.
 import unicodedata
 
 from keylayout_to_xkb.common.models import ModifierState, OutputKind
+from keylayout_to_xkb.common.policy import layout_is_unicode_accumulator
 from keylayout_to_xkb.common.mac_virtual_keys import VK_NAMES
 
 
@@ -327,6 +328,31 @@ def _dead_key_section(layout, variant, lines: list) -> None:
         return
     lines.append('\n<div style="page-break-before: always"></div>\n')
     lines.append('\n## Dead keys\n')
+    if layout_is_unicode_accumulator(layout):
+        lines.append(
+            '\nThis layout uses its dead keys as a Unicode hex-digit '
+            'accumulator: holding Option and typing a four-digit hex code '
+            'enters the corresponding codepoint (65,536 leaf sequences in '
+            'total). Enumerating the intermediate states adds nothing a reader '
+            'can use, so this section is collapsed -- %d dead-key states '
+            'omitted.\n' % len(layout.dead_states)
+        )
+        lines.append(
+            '\nOn Linux, the direct equivalent is Ctrl+Shift+U followed by the '
+            'hex codepoint, committed with Space or Enter. This is the GTK '
+            'Unicode input method: it works natively in GTK apps (including '
+            'GTK4 under Wayland) and elsewhere through the IBus or fcitx5 '
+            'input frameworks, and -- unlike the macOS Unicode Hex Input -- it '
+            'can enter codepoints beyond U+FFFF, such as emoji.\n'
+        )
+        lines.append(
+            '\nFor accents and symbols without memorizing codepoints, the '
+            'Compose (Multi_key) key offers thousands of mnemonic sequences '
+            '(for example, Compose followed by a quote and then a vowel yields '
+            'an accented letter such as \u00e9), configurable per desktop and '
+            'extensible through a personal ~/.XCompose file.\n'
+        )
+        return
     lines.append(
         '\nEach dead key composes with the next key pressed. A base key with no '
         'listed composition falls back to the dead key\'s accent character '
