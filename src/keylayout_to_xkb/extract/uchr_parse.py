@@ -320,7 +320,7 @@ def _build_variant_keys(
     Returns (keys, plane_tables): the fresh keys dict and the resolved
     {ModifierState: char-table index} map for this variant (so the caller can
     record it on the Variant for documentation-identity collapsing). Uses the
-    validated byte+2 plane resolution against the record's own char tables and
+    validated plane resolution against the record's own char tables and
     modifier map. Dead states are shared (passed in), not rebuilt.
     """
 
@@ -804,33 +804,34 @@ def _resolve_plane_tables(
 ) -> 'dict':
     """Map each ModifierState plane to its char-table index via the modifier map.
 
-    The plane's char table is keyModifiersToTableNum[plane_byte + 2], where
-    plane_byte is the standard Carbon modifierKeyState for the plane:
+    The plane's char table is keyModifiersToTableNum[plane_byte], where
+    plane_byte is the standard Carbon modifierKeyState for the plane. The byte
+    indexes the tableNum array DIRECTLY:
 
-        PLAIN              0x00  -> index 0x02
-        SHIFT              0x02  -> index 0x04
-        OPTION             0x08  -> index 0x0A
-        SHIFT_OPTION       0x0A  -> index 0x0C
-        CAPS               0x04  -> index 0x06
-        CAPS_SHIFT         0x06  -> index 0x08
-        CAPS_OPTION        0x0C  -> index 0x0E
-        CAPS_SHIFT_OPTION  0x0E  -> index 0x10
+        PLAIN              0x00
+        SHIFT              0x02
+        CAPS               0x04
+        CAPS_SHIFT         0x06
+        OPTION             0x08
+        SHIFT_OPTION       0x0A
+        CAPS_OPTION        0x0C
+        CAPS_SHIFT_OPTION  0x0E
 
-    The +2 offset is the transform UCKeyTranslate itself applies between the
-    modifier byte and the table index. It was extracted by exhaustively driving
-    the real UCKeyTranslate across every modifier byte on all 241 installed
-    macOS layouts and inverting its output against the raw array: index = byte+2
-    reproduces the OS plane->table selection on 228/241 layouts at 100% and
-    99.55% of all cells overall. The residual misses are NOT selection errors --
-    they are (a) ISO/JIS keyboard-type variant keys (vk50/vk94) and (b)
-    supplementary-plane codepoint decoding, both orthogonal to this mapping.
+    There is NO +2 (or any other) transform between the modifier byte and the
+    array index. An earlier revision applied a '+2' here, but that was
+    compensation for a misaligned map decode that read the tableNum array two
+    bytes early; aligning the decode to the real struct removed both the misread
+    and the +2 that canceled it. See the ALIGNMENT NOTE in
+    _parse_modifier_table_map for the full account and the byte-for-byte
+    equivalence check across all 241 layouts (1401 keyboard-type records) that
+    validated the aligned, direct-indexing decode.
 
-    The caps quartet (caps bit 0x04) uses the SAME transform and decodes with the
+    The caps quartet (caps bit 0x04) resolves the SAME way and decodes with the
     same machinery; a caps-layer validation matched the OS at 99.96% across all
     layouts. The caps tables carry genuinely-typeable output (e.g. Latin behind
     caps on non-Latin layouts, unique caps+option symbols), captured WITHOUT
     classifying caps behavior -- each caps plane simply reads whatever table its
-    byte+2 index points at.
+    own modifier byte points at.
 
     This replaces the former content-heuristic resolver: with the transform
     known, planes are read directly from the layout's own modifier map rather

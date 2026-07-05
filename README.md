@@ -23,6 +23,34 @@ scripts, or Tibetan stacks on a Mac loses that muscle memory on Linux. This
 tool replicates the macOS methods and characters as closely as XKB allows,
 by translating Apple's own layout data rather than approximating it.
 
+### XKB and XCompose: a paired layout, not a single file
+
+Faithfully reproducing a macOS keyboard layout on Linux requires **two**
+output files working together — an XKB symbols file *and* an XCompose file —
+because no single mechanism covers everything a Mac layout does. XKB carries
+the per-key, per-level characters and the *identity* of each dead key (that a
+key is `dead_grave`, say), but it cannot express what a dead key *composes
+to*, nor can a single keysym emit a multi-character result. Those two things —
+every dead-key composition, and every base-plus-combining-mark result that has
+no precomposed form — live in the XCompose file. Split the pair and you lose
+either the accents or the composed output; the layout only behaves like its
+macOS original when both are installed and the XCompose companion is
+self-contained rather than dependent on whatever Compose data the host locale
+happens to ship.
+
+This differs from how Linux keyboard layouts are usually packaged upstream.
+The standard XKB workflow treats a layout as a single symbols file (a national
+`mac` variant, for instance) and leans on the shared, system-wide Compose data
+for anything compositional, on the assumption that dead-key behavior is
+largely common across layouts. Mac layouts break that assumption: their
+dead-key graphs are layout-specific, sometimes several levels deep, and
+frequently produce multi-codepoint strings that the shared Compose files were
+never meant to carry. So this tool ships each layout as a matched symbols +
+Compose pair scoped to that one layout, rather than as a lone symbols file
+relying on host-provided composition — a packaging shape that reproduces macOS
+behavior exactly, but that a distribution maintainer used to the single-file
+convention should expect to look different from what they normally review.
+
 ## What this tool DOES NOT do
 
 This puts the expected characters in the expected places on the chosen keyboard
@@ -72,9 +100,10 @@ produce, and compares the tool's model against those answers. As of
 layouts shipped with macOS: roughly 150,000 machine-verified claims, zero
 divergences. (Two of those 241 catalog entries are literal duplicates --
 the Wubihua pair -- so an installer built from the full catalog carries
-239 unique layouts, and says so in its name.) A wrong character on Linux therefore points at emission or
-installation, never at a misread layout. The gory details, including every
-wrong turn taken on the way, live in `docs/UCHR_FORMAT_HANDOFF.md`.
+239 unique layouts, and says so in its name.) A wrong character on Linux 
+therefore points at emission or installation, never at a misread layout.
+The gory details, including every wrong turn taken on the way, live
+in `docs/UCHR_FORMAT_HANDOFF.md`.
 
 ## Quick start
 
